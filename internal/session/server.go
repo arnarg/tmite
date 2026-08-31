@@ -179,12 +179,7 @@ type Info struct {
 // is cancelled, cfg.Timeout elapses without a client, or the piped
 // session finishes.
 func StartServer(parent context.Context, cfg ServerConfig) *Server {
-	baseCtx, baseCancel := context.WithCancel(parent)
-	ctx, cancel := baseCtx, baseCancel
-	if cfg.Timeout > 0 {
-		tctx, tcancel := context.WithTimeout(baseCtx, cfg.Timeout)
-		ctx, cancel = tctx, func() { tcancel(); baseCancel() }
-	}
+	ctx, cancel := context.WithCancel(parent)
 
 	s := &Server{
 		id:      newID(),
@@ -423,7 +418,15 @@ func (s *Server) terminalCause(err error) State {
 func (s *Server) markReady() { s.ready.Do(func() { close(s.readyCh) }) }
 
 func (s *Server) run() {
+	// The session timeout bounds only the wait for a client; once one
+	// is accepted, the tunnel runs on the base context until the client
+	// closes it or the daemon shuts down.
 	ctx := s.ctx
+	if s.cfg.Timeout > 0 {
+		tctx, tcancel := context.WithTimeout(ctx, s.cfg.Timeout)
+		defer tcancel()
+		ctx = tctx
+	}
 	defer s.cancel()
 	defer close(s.done)
 
@@ -494,7 +497,7 @@ func (s *Server) run() {
 	}
 	publish(ep.Addr())
 	go func() {
-		for addr := range ep.WatchAddr().Stream(ctx) {
+		for addr := range ep.WatchAddr().Stream(s.ctx) {
 			publish(addr)
 		}
 	}()
@@ -516,7 +519,7 @@ func (s *Server) run() {
 			_ = conn.CloseWithError(0, "tmite: unknown client")
 			continue
 		}
-		connected, err := s.serve(ctx, conn)
+		connected, err := s.serve(s.ctx, conn)
 		switch {
 		case connected:
 			s.finish(StateDone, nil)
