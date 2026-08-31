@@ -1,0 +1,54 @@
+schema = 3
+
+[mod]
+  [mod.'filippo.io/edwards25519']
+    version = 'v1.2.0'
+    hash = 'sha256-VOgoreEdslftsR/MyEnZAlutqvph4T57NR1mT9+APfg='
+
+  [mod.'github.com/coder/websocket']
+    version = 'v1.8.14'
+    hash = 'sha256-3lTpVWweJJ+VjIIwcK9Ca+mWrbAYPxi4tx7anP1sFYw='
+
+  [mod.'github.com/flynn/noise']
+    version = 'v1.1.0'
+    hash = 'sha256-gHCdm9oJTKO+aUGWCw9LM/WHrZT2K6C5+j7VLXpqK48='
+
+  [mod.'github.com/klauspost/cpuid/v2']
+    version = 'v2.0.9'
+    hash = 'sha256-0rHlHzEVaDdkVbRJDhnAJjfJUmAHOYjXN5u7VoCi5uk='
+
+  [mod.'github.com/quic-go/quic-go']
+    version = 'v0.59.1'
+    hash = 'sha256-2kg8bqkd6TTih3j0odddT1Q5NRpSmYryu79rxaNSo2o='
+
+  [mod.'github.com/schollz/mnemonicode']
+    version = 'v1.0.1'
+    hash = 'sha256-OmifbSOsGH7IaBl/+COcqVcxejESmYoJHT47T9Co0hQ='
+
+  [mod.'github.com/tmc/go-iroh']
+    version = 'v0.1.0'
+    hash = 'sha256-CcMsmImM1xEVIOSgQES1dabiJDRs1B4SugbKNkEiZkw='
+
+  [mod.'github.com/urfave/cli/v3']
+    version = 'v3.11.0'
+    hash = 'sha256-eRl3+ju/aunSEE2czagBZOdhPVc6P/GEajpbNwnSY2Q='
+
+  [mod.'golang.org/x/crypto']
+    version = 'v0.52.0'
+    hash = 'sha256-/6Ajm6bIPt5xXNL5mmeNfJh4EZjgFgVlHEwp1TiC5cM='
+
+  [mod.'golang.org/x/net']
+    version = 'v0.55.0'
+    hash = 'sha256-Phi2mSmBGOJcvqPPAit3uqF3UP8SKRI9dHj6yTM3s5s='
+
+  [mod.'golang.org/x/sys']
+    version = 'v0.45.0'
+    hash = 'sha256-hkBoNazrDA67ER6sWhb+EKxx9nJ24+nz3zGy+zT5Hvw='
+
+  [mod.'golang.org/x/text']
+    version = 'v0.37.0'
+    hash = 'sha256-8XDOnlPIybcDRy89fkjG5VqtIt5Ku+LmaqYhgKl7i1E='
+
+  [mod.'lukechampine.com/blake3']
+    version = 'v1.4.1'
+    hash = 'sha256-HaZGo9L44ptPsgxIhvKy3+0KZZm1+xt+cZC1rDQA9Yc='
