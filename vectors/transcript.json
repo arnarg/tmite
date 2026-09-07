@@ -1,0 +1,37 @@
+{
+  "description": "Pairing handshake transcript (tmite-pair/1) for the given fixed inputs; both independently built parties must produce these exact bytes.",
+  "inputs": {
+    "client_version": "0.1.0",
+    "code": "academy academy academy siren alibi",
+    "confirm_name": "laptop",
+    "confirm_node_id_hex": "1111111111111111111111111111111111111111111111111111111111111111",
+    "entropy_hex": "0000000000"
+  },
+  "frames": [
+    {
+      "direction": "client_to_server",
+      "msg_type": "0x01",
+      "payload_json": "{\"type\":\"version\",\"version\":1}",
+      "frame_hex": "010000001e7b2274797065223a2276657273696f6e222c2276657273696f6e223a317d"
+    },
+    {
+      "direction": "client_to_server",
+      "msg_type": "0x02",
+      "payload_json": "{\"type\":\"pair_hello\",\"client_version\":\"0.1.0\"}",
+      "frame_hex": "020000002e7b2274797065223a22706169725f68656c6c6f222c22636c69656e745f76657273696f6e223a22302e312e30227d"
+    },
+    {
+      "direction": "server_to_client",
+      "msg_type": "0x03",
+      "payload_json": "{\"type\":\"pair_wait\"}",
+      "frame_hex": "03000000147b2274797065223a22706169725f77616974227d"
+    },
+    {
+      "direction": "server_to_client",
+      "msg_type": "0x04",
+      "payload_json": "{\"type\":\"pair_confirm\",\"node_id\":[17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17],\"name\":\"laptop\"}",
+      "frame_hex": "04000000937b2274797065223a22706169725f636f6e6669726d222c226e6f64655f6964223a5b31372c31372c31372c31372c31372c31372c31372c31372c31372c31372c31372c31372c31372c31372c31372c31372c31372c31372c31372c31372c31372c31372c31372c31372c31372c31372c31372c31372c31372c31372c31372c31375d2c226e616d65223a226c6170746f70227d"
+    }
+  ],
+  "transcript_hex": "010000001e7b2274797065223a2276657273696f6e222c2276657273696f6e223a317d020000002e7b2274797065223a22706169725f68656c6c6f222c22636c69656e745f76657273696f6e223a22302e312e30227d03000000147b2274797065223a22706169725f77616974227d04000000937b2274797065223a22706169725f636f6e6669726d222c226e6f64655f6964223a5b31372c31372c31372c31372c31372c31372c31372c31372c31372c31372c31372c31372c31372c31372c31372c31372c31372c31372c31372c31372c31372c31372c31372c31372c31372c31372c31372c31372c31372c31372c31372c31375d2c226e616d65223a226c6170746f70227d"
+}

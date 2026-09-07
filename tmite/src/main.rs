@@ -1,0 +1,537 @@
+use std::io::Write as _;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicI32, Ordering};
+
+use anyhow::{Context, bail};
+use clap::{Parser, Subcommand};
+use tmite_core::client::connect::{ConnectParams, parse_fwd_spec};
+use tmite_core::client::pair::{PairParams, PairUi};
+use tmite_core::daemon::{DaemonConfig, run as daemon_run};
+use tmite_core::fsio::{default_client_data_dir, load_or_create_keypair};
+use tmite_core::net::{NetOpts, grouped_hex};
+
+static EXIT_CODE: AtomicI32 = AtomicI32::new(0);
+
+#[derive(Clone, Parser)]
+#[command(
+    name = "tmite",
+    version,
+    about = "Temporary forwarding tunnels over iroh"
+)]
+struct Cli {
+    /// Verbosity: -v info, -vv trace (RUST_LOG also respected)
+    #[arg(short = 'v', action = clap::ArgAction::Count, global = true)]
+    verbose: u8,
+
+    /// Override the data directory
+    #[arg(long, global = true)]
+    data_dir: Option<PathBuf>,
+
+    /// Daemon IPC socket path (server commands)
+    #[arg(long, global = true)]
+    socket_path: Option<PathBuf>,
+
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Clone, Subcommand)]
+enum Command {
+    /// Run the daemon (server role)
+    Daemon {
+        /// Custom relay URL (repeatable; replaces the n0 relay map)
+        #[arg(long = "relay")]
+        relay: Vec<String>,
+        /// Self-hosted pkarr relay for publishing and resolution
+        #[arg(long)]
+        pkarr: Option<String>,
+        /// Per-stream idle timeout in seconds (0 = disabled)
+        #[arg(long, default_value_t = 0)]
+        idle_timeout: u64,
+    },
+    /// Server admin commands (via the daemon's IPC socket)
+    Peer {
+        #[command(subcommand)]
+        cmd: PeerCmd,
+    },
+    /// Show daemon status
+    Status,
+    /// Pair this client with a server using a spoken code
+    Pair {
+        /// The 5-word code (prompted if omitted)
+        code: Option<String>,
+        /// Skip interactive confirmation checks
+        #[arg(long)]
+        yes: bool,
+        /// Local alias for the server (defaults to the server-chosen name)
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// Connect local listeners to a paired server
+    Connect {
+        /// Server alias from pairing
+        name: String,
+        /// Forward spec: [LOCAL_ADDR:]LOCAL_PORT:TARGET (repeatable)
+        #[arg(long = "fwd")]
+        fwd: Vec<String>,
+    },
+    /// Print this node's iroh NodeId
+    NodeId,
+}
+
+#[derive(Clone, Subcommand)]
+enum PeerCmd {
+    /// Create a pairing invite and wait for the admin's decision
+    Invite {
+        /// Peer name to register (becomes the ACL namespace)
+        #[arg(long)]
+        name: String,
+        /// Invite TTL in seconds
+        #[arg(long)]
+        ttl: Option<u64>,
+        /// Skip the y/N prompt for scripting (weakens the identity check)
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Grant a peer access to one exact target
+    Allow { peer: String, target: String },
+    /// Remove one rule from a peer
+    Revoke { peer: String, target: String },
+    /// List peers, rules, and pending invites
+    Ls,
+    /// Delete a peer
+    Rm {
+        peer: String,
+        /// Also delete the peer's rules
+        #[arg(long)]
+        force: bool,
+    },
+}
+
+#[tokio::main]
+async fn main() {
+    let cli = Cli::parse();
+    init_tracing(cli.verbose);
+
+    let result = match &cli.command {
+        Command::Daemon {
+            relay,
+            pkarr,
+            idle_timeout,
+        } => {
+            let data_dir = cli
+                .data_dir
+                .clone()
+                .unwrap_or_else(|| PathBuf::from("/var/lib/tmite"));
+            let socket_path = cli
+                .socket_path
+                .clone()
+                .unwrap_or_else(|| PathBuf::from("/run/tmite/daemon.sock"));
+            daemon_run(DaemonConfig {
+                data_dir,
+                socket_path,
+                idle_timeout: std::time::Duration::from_secs(*idle_timeout),
+                net_opts: NetOpts {
+                    relay_urls: relay.clone(),
+                    pkarr_url: pkarr.clone(),
+                },
+            })
+            .await
+            .map_err(anyhow::Error::from)
+        }
+        Command::Peer { cmd } => peer_cmd(cli.clone(), cmd.clone()).await,
+        Command::Status => status_cmd(&cli).await,
+        Command::Pair {
+            code,
+            name,
+            ..
+        } => pair_cmd(&cli, code.clone(), name.clone()).await,
+        Command::Connect { name, fwd } => connect_cmd(&cli, name.clone(), fwd.clone()).await,
+        Command::NodeId => node_id_cmd(&cli),
+    };
+
+    if let Err(e) = result {
+        eprintln!("tmite: {e:#}");
+        // Propagate a specific exit code if the inner layer set one.
+        std::process::exit(EXIT_CODE.load(Ordering::SeqCst).max(1));
+    }
+}
+
+fn init_tracing(verbose: u8) {
+    use tracing_subscriber::EnvFilter;
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| match verbose {
+        0 => EnvFilter::new("warn"),
+        1 => EnvFilter::new("info"),
+        _ => EnvFilter::new("trace"),
+    });
+    let _ = tracing_subscriber::fmt()
+        .with_target(false)
+        .event_format(tracing_subscriber::fmt::format::Format::default().compact())
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .try_init();
+}
+
+fn client_data_dir(cli: &Cli) -> PathBuf {
+    cli.data_dir.clone().unwrap_or_else(default_client_data_dir)
+}
+
+fn daemon_socket(cli: &Cli) -> PathBuf {
+    cli.socket_path
+        .clone()
+        .unwrap_or_else(|| PathBuf::from("/run/tmite/daemon.sock"))
+}
+
+// ---------------------------------------------------------------------------
+// IPC client (bin layer)
+// ---------------------------------------------------------------------------
+
+struct IpcConn {
+    reader: tokio::io::BufReader<tokio::net::unix::OwnedReadHalf>,
+    write: tokio::net::unix::OwnedWriteHalf,
+}
+
+async fn ipc_connect(path: &PathBuf) -> anyhow::Result<IpcConn> {
+    let stream = tokio::net::UnixStream::connect(path)
+        .await
+        .with_context(|| format!("cannot connect to daemon socket {}", path.display()))?;
+    let (read, write) = stream.into_split();
+    Ok(IpcConn {
+        reader: tokio::io::BufReader::new(read),
+        write,
+    })
+}
+
+impl IpcConn {
+    async fn send(&mut self, line: &str) -> anyhow::Result<()> {
+        use tokio::io::AsyncWriteExt;
+        self.write.write_all(line.as_bytes()).await?;
+        self.write.write_all(b"\n").await?;
+        self.write.flush().await?;
+        Ok(())
+    }
+
+    async fn reply(&mut self) -> anyhow::Result<Option<tmite_proto::ipc::Reply>> {
+        use tokio::io::AsyncBufReadExt;
+        let mut line = String::new();
+        let n = self.reader.read_line(&mut line).await?;
+        if n == 0 {
+            return Ok(None);
+        }
+        Ok(Some(serde_json::from_str(line.trim())?))
+    }
+}
+
+fn ipc_request(id: u64, method: &str, params: serde_json::Value) -> String {
+    serde_json::json!({ "id": id, "method": method, "params": params }).to_string()
+}
+
+async fn ipc_call(
+    path: &PathBuf,
+    method: &str,
+    params: serde_json::Value,
+) -> anyhow::Result<serde_json::Value> {
+    let mut conn = ipc_connect(path).await?;
+    conn.send(&ipc_request(1, method, params)).await?;
+    loop {
+        let Some(reply) = conn.reply().await? else {
+            bail!("daemon closed the IPC connection");
+        };
+        if reply.id != 1 {
+            continue;
+        }
+        if let Some(err) = reply.error {
+            bail!("daemon error [{}]: {}", err.code, err.message);
+        }
+        if let Some(result) = reply.result {
+            return Ok(result);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Commands
+// ---------------------------------------------------------------------------
+
+async fn peer_cmd(cli: Cli, cmd: PeerCmd) -> anyhow::Result<()> {
+    let socket = daemon_socket(&cli);
+    match cmd {
+        PeerCmd::Invite { name, ttl, yes } => invite_cmd(&socket, name, ttl, yes).await,
+        PeerCmd::Allow { peer, target } => {
+            let result = ipc_call(
+                &socket,
+                "peer.allow",
+                serde_json::json!({ "peer": peer, "target": target }),
+            )
+            .await?;
+            println!("rule added: {result}");
+            Ok(())
+        }
+        PeerCmd::Revoke { peer, target } => {
+            let result = ipc_call(
+                &socket,
+                "peer.revoke",
+                serde_json::json!({ "peer": peer, "target": target }),
+            )
+            .await?;
+            let removed = result
+                .get("removed")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            if removed {
+                println!("rule removed");
+            } else {
+                println!("no such rule");
+            }
+            Ok(())
+        }
+        PeerCmd::Ls => {
+            let result = ipc_call(&socket, "peer.ls", serde_json::json!({})).await?;
+            println!("{result:#}");
+            Ok(())
+        }
+        PeerCmd::Rm { peer, force } => {
+            let result = ipc_call(
+                &socket,
+                "peer.rm",
+                serde_json::json!({ "peer": peer, "force": force }),
+            )
+            .await?;
+            let removed = result
+                .get("removed")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            if removed {
+                println!("peer {peer:?} removed");
+            } else {
+                println!("no such peer");
+            }
+            Ok(())
+        }
+    }
+}
+
+async fn invite_cmd(
+    socket: &PathBuf,
+    name: String,
+    ttl: Option<u64>,
+    yes: bool,
+) -> anyhow::Result<()> {
+    let mut conn = ipc_connect(socket).await?;
+    conn.send(&ipc_request(
+        1,
+        "peer.invite",
+        serde_json::json!({ "name": name, "ttl": ttl }),
+    ))
+    .await?;
+
+    let mut decided = false;
+    loop {
+        let Some(reply) = conn.reply().await? else {
+            bail!("daemon closed the IPC connection");
+        };
+        if reply.id != 1 {
+            continue;
+        }
+        if let Some(err) = reply.error {
+            bail!("daemon error [{}]: {}", err.code, err.message);
+        }
+        if let Some(event) = reply.event {
+            match event.as_str() {
+                "code" => {
+                    let data = reply.data.unwrap_or(serde_json::Value::Null);
+                    let code = data
+                        .get("code")
+                        .and_then(|c| c.as_str())
+                        .unwrap_or("<unknown>");
+                    let ttl_secs = data.get("ttl_secs").and_then(|t| t.as_u64()).unwrap_or(0);
+                    println!("Invite code (valid for {ttl_secs}s):");
+                    println!("  {code}");
+                    println!("Read this code to the client operator.");
+                }
+                "pair_request" => {
+                    let data = reply.data.unwrap_or(serde_json::Value::Null);
+                    let node_id = data
+                        .get("node_id")
+                        .and_then(|n| n.as_str())
+                        .unwrap_or("<unknown>")
+                        .to_string();
+                    println!("Pairing request from client:");
+                    println!("  {}", grouped_node_id(&node_id));
+                    let accept = yes || prompt_y_n()?;
+                    conn.send(&ipc_request(
+                        2,
+                        "peer.invite.decide",
+                        serde_json::json!({
+                            "invite_id": data.get("invite_id"),
+                            "accept": accept
+                        }),
+                    ))
+                    .await?;
+                    decided = true;
+                }
+                "expired" if !decided && !yes => {
+                    println!("Invite expired.");
+                }
+                "cancelled" => bail!("invite cancelled"),
+                _ => {}
+            }
+        }
+        if let Some(result) = reply.result {
+            let status = result.get("status").and_then(|s| s.as_str()).unwrap_or("");
+            match status {
+                "paired" => {
+                    let node_id = result
+                        .get("node_id")
+                        .and_then(|n| n.as_str())
+                        .unwrap_or("<unknown>");
+                    println!("Paired. Peer registered as:");
+                    println!("  {node_id}");
+                    return Ok(());
+                }
+                "rejected" => {
+                    println!("Invite rejected; the code is now dead.");
+                    return Ok(());
+                }
+                "expired" => {
+                    println!("Invite expired without a pairing.");
+                    return Ok(());
+                }
+                _ => bail!("unexpected result: {result}"),
+            }
+        }
+    }
+}
+
+fn prompt_y_n() -> anyhow::Result<bool> {
+    print!("Pair this client? [y/N] ");
+    let _ = std::io::stdout().flush();
+    // Read from /dev/tty so piped input cannot auto-confirm (§9.3).
+    use std::io::BufRead;
+    let mut tty = std::io::BufReader::new(
+        std::fs::File::open("/dev/tty")
+            .context("no TTY available for confirmation; pass --yes for scripting")?,
+    );
+    let mut line = String::new();
+    tty.read_line(&mut line)?;
+    match line.trim().to_ascii_lowercase().as_str() {
+        "y" | "yes" => Ok(true),
+        _ => Ok(false),
+    }
+}
+
+fn grouped_node_id(node_id: &str) -> String {
+    let bytes: Vec<u8> = (0..node_id.len())
+        .step_by(2)
+        .filter_map(|i| u8::from_str_radix(&node_id[i..i + 2], 16).ok())
+        .collect();
+    grouped_hex(&bytes)
+}
+
+async fn status_cmd(cli: &Cli) -> anyhow::Result<()> {
+    let result = ipc_call(&daemon_socket(cli), "daemon.status", serde_json::json!({})).await?;
+    println!("{result:#}");
+    Ok(())
+}
+
+struct PairPromptUi;
+
+impl PairUi for PairPromptUi {
+    fn info(&self, msg: &str) {
+        println!("{msg}");
+    }
+    fn show_node_id(&self, id: &iroh::PublicKey) {
+        println!("This client's NodeId:");
+        println!("  {}", grouped_hex(&id.as_bytes()[..]));
+    }
+    fn paired(&self, name: &str, server_id: &iroh::PublicKey) {
+        println!("Paired as {name:?} on:");
+        println!("  {}", grouped_hex(&server_id.as_bytes()[..]));
+    }
+}
+
+async fn pair_cmd(cli: &Cli, code: Option<String>, name: Option<String>) -> anyhow::Result<()> {
+    let name = name
+        .map(|n| n.trim().to_string())
+        .filter(|n| !n.is_empty());
+    let mut code_opt = code;
+    let mut attempts = 0;
+    loop {
+        if code_opt.is_none() {
+            code_opt = Some(prompt_code()?);
+        }
+        let code = code_opt.clone().unwrap();
+        match tmite_proto::pairing::code_to_entropy(&code) {
+            Ok(_) => {
+                code_opt = Some(code);
+                break;
+            }
+            Err(e) => {
+                attempts += 1;
+                if attempts >= tmite_proto::limits::PAIR_MAX_ATTEMPTS {
+                    EXIT_CODE.store(2, Ordering::SeqCst);
+                    bail!("invalid code: {e}");
+                }
+                eprintln!(
+                    "tmite: {e}; try again ({}/{} attempts left)",
+                    tmite_proto::limits::PAIR_MAX_ATTEMPTS - attempts,
+                    tmite_proto::limits::PAIR_MAX_ATTEMPTS
+                );
+                code_opt = None;
+            }
+        }
+    }
+    let code = code_opt.unwrap();
+
+    let params = PairParams {
+        code,
+        data_dir: client_data_dir(cli),
+        client_version: tmite_core::CRATE_VERSION.to_string(),
+        net_opts: NetOpts::default(),
+        name,
+    };
+    let ui = PairPromptUi;
+    match tmite_core::client::pair::run(params, &ui).await {
+        Ok(_) => Ok(()),
+        Err(e) => {
+            EXIT_CODE.store(e.exit_code(), Ordering::SeqCst);
+            bail!("{e}");
+        }
+    }
+}
+
+fn prompt_code() -> anyhow::Result<String> {
+    print!("Enter the pairing code: ");
+    let _ = std::io::stdout().flush();
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line)?;
+    Ok(line.trim().to_string())
+}
+
+async fn connect_cmd(cli: &Cli, name: String, fwd: Vec<String>) -> anyhow::Result<()> {
+    if fwd.is_empty() {
+        bail!("at least one --fwd spec is required");
+    }
+    let mut specs = Vec::new();
+    for spec in fwd {
+        specs.push(parse_fwd_spec(&spec)?);
+    }
+    let params = ConnectParams {
+        name,
+        specs,
+        data_dir: client_data_dir(cli),
+        net_opts: NetOpts::default(),
+    };
+    println!("Connecting... (first connection through a cold tunnel may take a few seconds)");
+    tmite_core::client::connect::run(params)
+        .await
+        .map_err(anyhow::Error::from)
+}
+
+fn node_id_cmd(cli: &Cli) -> anyhow::Result<()> {
+    let data_dir = cli.data_dir.clone().unwrap_or_else(default_client_data_dir);
+    let keypair = load_or_create_keypair(&data_dir.join("keypair"))?;
+    let id = keypair.public();
+    println!("{}", grouped_hex(&id.as_bytes()[..]));
+    Ok(())
+}

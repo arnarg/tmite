@@ -1,0 +1,15 @@
+[package]
+name = "tmite-proto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+hex.workspace = true
+sha2.workspace = true
+hkdf.workspace = true
+mnemonic.workspace = true
+getrandom.workspace = true
