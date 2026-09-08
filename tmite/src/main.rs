@@ -347,11 +347,12 @@ async fn invite_cmd(
     .await?;
 
     let mut decided = false;
+    let mut invite_id: Option<String> = None;
     loop {
         let Some(reply) = conn.reply().await? else {
             bail!("daemon closed the IPC connection");
         };
-        if reply.id != 1 {
+        if reply.id != 1 && reply.id != 2 {
             continue;
         }
         if let Some(err) = reply.error {
@@ -366,6 +367,10 @@ async fn invite_cmd(
                         .and_then(|c| c.as_str())
                         .unwrap_or("<unknown>");
                     let ttl_secs = data.get("ttl_secs").and_then(|t| t.as_u64()).unwrap_or(0);
+                    invite_id = data
+                        .get("invite_id")
+                        .and_then(|i| i.as_str())
+                        .map(str::to_string);
                     println!("Invite code (valid for {ttl_secs}s):");
                     println!("  {code}");
                     println!("Read this code to the client operator.");
@@ -380,11 +385,17 @@ async fn invite_cmd(
                     println!("Pairing request from client:");
                     println!("  {}", grouped_node_id(&node_id));
                     let accept = yes || prompt_y_n()?;
+                    let invite_id = data
+                        .get("invite_id")
+                        .and_then(|i| i.as_str())
+                        .map(str::to_string)
+                        .or_else(|| invite_id.clone())
+                        .unwrap_or_default();
                     conn.send(&ipc_request(
                         2,
                         "peer.invite.decide",
                         serde_json::json!({
-                            "invite_id": data.get("invite_id"),
+                            "invite_id": invite_id,
                             "accept": accept
                         }),
                     ))
@@ -399,6 +410,9 @@ async fn invite_cmd(
             }
         }
         if let Some(result) = reply.result {
+            if reply.id != 1 {
+                continue;
+            }
             let status = result.get("status").and_then(|s| s.as_str()).unwrap_or("");
             match status {
                 "paired" => {

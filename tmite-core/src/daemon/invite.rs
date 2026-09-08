@@ -11,6 +11,7 @@ use crate::daemon::state::{Peer, State};
 use crate::fsio;
 use crate::net::{EndpointRole, NetOpts, RejectDelay, build_endpoint};
 use crate::stream_io::{expect_frame, write_frame};
+use iroh::endpoint::RecvStream;
 use tmite_proto::alpn::PAIRING_ALPN;
 use tmite_proto::frame::{PairDenyReason, PairingFrame, TYPE_PAIR_HELLO, TYPE_VERSION};
 use tmite_proto::ipc::{CodeEventData, InviteResult, PairRequestEventData, Reply};
@@ -362,6 +363,25 @@ async fn run_invite_endpoint(
     }
 }
 
+/// How long to wait for the client to finish its send side after writing a
+/// terminal frame. A closing endpoint can only send CONNECTION_CLOSE frames,
+/// so without this ack the verdict frame may never reach the client.
+const VERDICT_ACK_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Drains the client's send stream until EOF (or timeout) so the terminal
+/// frame we just wrote is delivered before the endpoint closes.
+async fn wait_for_verdict_ack(recv: &mut RecvStream) {
+    let _ = tokio::time::timeout(VERDICT_ACK_TIMEOUT, async {
+        loop {
+            match recv.read(&mut [0u8; 64]).await {
+                Ok(Some(_)) => continue,
+                _ => return,
+            }
+        }
+    })
+    .await;
+}
+
 /// Handles one pairing connection on the invite endpoint (§5).
 async fn handle_pair_conn(conn: Connection, shared: Arc<InviteShared>) {
     let remote = conn.remote_id();
@@ -403,6 +423,7 @@ async fn handle_pair_conn(conn: Connection, shared: Arc<InviteShared>) {
         };
         let _ = write_frame(&mut send, frame.msg_type(), &frame).await;
         let _ = send.finish();
+        wait_for_verdict_ack(&mut recv).await;
         reject!();
     }
     if write_frame(
@@ -419,6 +440,7 @@ async fn handle_pair_conn(conn: Connection, shared: Arc<InviteShared>) {
     shared.emit(
         "pair_request",
         json!(PairRequestEventData {
+            invite_id: shared.invite_id.clone(),
             node_id: remote.to_string(),
         }),
     );
@@ -445,6 +467,7 @@ async fn handle_pair_conn(conn: Connection, shared: Arc<InviteShared>) {
             };
             let _ = write_frame(&mut send, frame.msg_type(), &frame).await;
             let _ = send.finish();
+            wait_for_verdict_ack(&mut recv).await;
             if reason == PairDenyReason::AdminDenied {
                 shared.delay.lock().await.escalate();
             }
@@ -471,6 +494,7 @@ async fn handle_pair_conn(conn: Connection, shared: Arc<InviteShared>) {
                         };
                         let _ = write_frame(&mut send, frame.msg_type(), &frame).await;
                         let _ = send.finish();
+                        wait_for_verdict_ack(&mut recv).await;
                         let _ = shared.outcome_tx.send(Outcome::Paired {
                             node_id: remote.to_string(),
                         });
@@ -483,6 +507,7 @@ async fn handle_pair_conn(conn: Connection, shared: Arc<InviteShared>) {
                         };
                         let _ = write_frame(&mut send, frame.msg_type(), &frame).await;
                         let _ = send.finish();
+                        wait_for_verdict_ack(&mut recv).await;
                         let _ = shared.outcome_tx.send(Outcome::Rejected);
                     }
                 }
@@ -494,6 +519,7 @@ async fn handle_pair_conn(conn: Connection, shared: Arc<InviteShared>) {
                 };
                 let _ = write_frame(&mut send, frame.msg_type(), &frame).await;
                 let _ = send.finish();
+                wait_for_verdict_ack(&mut recv).await;
             }
         }
     }

@@ -118,6 +118,7 @@ pub struct CodeEventData {
 /// Data carried on the `pair_request` event.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PairRequestEventData {
+    pub invite_id: String,
     pub node_id: String,
 }
 

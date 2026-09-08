@@ -135,7 +135,7 @@ pub async fn run(params: PairParams, ui: &dyn PairUi) -> Result<String, PairErro
 
     // Confirmation may legitimately take up to the 120 s prompt timeout plus
     // human latency; bound generously.
-    let verdict = tokio::time::timeout(
+    let result = tokio::time::timeout(
         limits::PROMPT_TIMEOUT + limits::PAIRING_READ_TIMEOUT + limits::PAIRING_READ_TIMEOUT,
         async {
             let (t, frame) = crate::stream_io::read_frame::<PairingFrame>(
@@ -157,7 +157,12 @@ pub async fn run(params: PairParams, ui: &dyn PairUi) -> Result<String, PairErro
         },
     )
     .await
-    .map_err(|_| PairError::Timeout)??;
+    .map_err(|_| PairError::Timeout)?;
+    // Ack the verdict (via FIN on our send side) so the invite endpoint knows
+    // the frame was delivered before it closes; a closing QUIC endpoint can
+    // no longer flush pending stream data.
+    let _ = send.finish();
+    let verdict = result?;
 
     endpoint.close().await;
 
