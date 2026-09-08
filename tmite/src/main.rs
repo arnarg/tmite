@@ -466,12 +466,139 @@ fn grouped_node_id(node_id: &str) -> String {
 async fn status_cmd(cli: &Cli) -> anyhow::Result<()> {
     let result = ipc_call(
         &daemon_socket_candidates(cli),
-        "daemon.status",
+        "daemon.sessions",
         serde_json::json!({}),
     )
     .await?;
-    println!("{result:#}");
+    let result: tmite_proto::ipc::SessionsResult = serde_json::from_value(result)?;
+    print_sessions_table(&result);
     Ok(())
+}
+
+/// One display row per peer; PROXIES and STATE may span multiple lines.
+struct StatusRow {
+    name: String,
+    node_id: String,
+    proxies: Vec<String>,
+    state: Vec<String>,
+}
+
+fn print_sessions_table(result: &tmite_proto::ipc::SessionsResult) {
+    let rows: Vec<StatusRow> = result
+        .peers
+        .iter()
+        .map(|p| {
+            let session = p.session.as_ref();
+            let proxies: Vec<String> = match session {
+                Some(s) if !s.forwards.is_empty() => s
+                    .forwards
+                    .iter()
+                    .map(|f| {
+                        if f.live > 0 {
+                            format!("{} \u{2192} {} ({})", f.local, f.target, f.live)
+                        } else {
+                            format!("{} \u{2192} {}", f.local, f.target)
+                        }
+                    })
+                    .collect(),
+                _ => vec!["-".to_string()],
+            };
+            let state: Vec<String> = match session {
+                Some(s) if !s.paths.is_empty() => s
+                    .paths
+                    .iter()
+                    .map(|path| {
+                        let kind = match path.kind {
+                            tmite_proto::ipc::PathKind::Direct => "direct".to_string(),
+                            tmite_proto::ipc::PathKind::Relay => "relay".to_string(),
+                        };
+                        let addr = match (&path.kind, &path.addr) {
+                            (tmite_proto::ipc::PathKind::Direct, Some(addr)) => {
+                                format!(" {addr}")
+                            }
+                            _ => String::new(),
+                        };
+                        let rtt = path
+                            .rtt_ms
+                            .map(|ms| format!(" ({ms}ms)"))
+                            .unwrap_or_default();
+                        let mark = if path.selected { "\u{25cf}" } else { "\u{25cb}" };
+                        format!("{mark} {kind}{addr}{rtt}")
+                    })
+                    .collect(),
+                _ => vec!["-".to_string()],
+            };
+            StatusRow {
+                name: p.name.clone(),
+                node_id: short_node_id(&p.node_id),
+                proxies,
+                state,
+            }
+        })
+        .collect();
+
+    if rows.is_empty() {
+        println!("no peers paired");
+        return;
+    }
+
+    let name_w = rows
+        .iter()
+        .map(|r| r.name.len())
+        .chain(std::iter::once("NAME".len()))
+        .max()
+        .unwrap_or(0);
+    let node_w = "NODE ID".len();
+    let proxy_w = rows
+        .iter()
+        .flat_map(|r| &r.proxies)
+        .map(|l| l.chars().count())
+        .chain(std::iter::once("PROXIES".len()))
+        .max()
+        .unwrap_or(0);
+
+    println!(
+        "{:<name_w$}  {:<node_w$}  {:<proxy_w$}  {}",
+        "NAME", "NODE ID", "PROXIES", "STATE"
+    );
+    for row in &rows {
+        let lines = row.proxies.len().max(row.state.len());
+        for i in 0..lines {
+            let name = if i == 0 { &row.name } else { "" };
+            let node_id = if i == 0 { &row.node_id } else { "" };
+            let proxy = line_or_dash(&row.proxies, i);
+            let state = line_or_dash(&row.state, i);
+            println!(
+                "{:<name_w$}  {:<node_w$}  {:<proxy_w$}  {}",
+                name,
+                node_id,
+                pad(proxy, proxy_w),
+                state
+            );
+        }
+    }
+}
+
+fn line_or_dash(lines: &[String], index: usize) -> &str {
+    lines.get(index).map(String::as_str).unwrap_or("")
+}
+
+fn pad(text: &str, width: usize) -> String {
+    let len = text.chars().count();
+    if len >= width {
+        text.to_string()
+    } else {
+        format!("{text}{}", " ".repeat(width - len))
+    }
+}
+
+/// First 8 hex chars plus an ellipsis, enough to spot the peer in `peer ls`.
+fn short_node_id(node_id: &str) -> String {
+    let mut short = node_id.chars().take(8).collect::<String>();
+    if node_id.chars().count() > 8 {
+        short.push('\u{2026}');
+    }
+    short
 }
 
 struct PairPromptUi;

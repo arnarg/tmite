@@ -7,6 +7,7 @@ use tokio::sync::mpsc;
 
 use crate::daemon::invite::InviteManager;
 use crate::daemon::ipc::{DaemonHandle, serve};
+use crate::daemon::sessions::Sessions;
 use crate::daemon::state::State;
 use crate::fsio::load_or_create_keypair;
 use crate::net::NetOpts;
@@ -14,6 +15,7 @@ use crate::net::NetOpts;
 pub mod invite;
 pub mod ipc;
 pub mod main_ep;
+pub mod sessions;
 pub mod state;
 
 #[derive(Debug, Error)]
@@ -45,6 +47,7 @@ pub async fn run(cfg: DaemonConfig) -> Result<(), DaemonError> {
     let node_id = secret_key.public().to_string();
 
     let state = Arc::new(State::load(&cfg.data_dir.join("state.toml"))?);
+    let sessions = Sessions::new();
     let invites = Arc::new(InviteManager::new(
         cfg.net_opts.clone(),
         state.clone(),
@@ -55,6 +58,7 @@ pub async fn run(cfg: DaemonConfig) -> Result<(), DaemonError> {
     let handle = Arc::new(DaemonHandle {
         state: state.clone(),
         invites: invites.clone(),
+        sessions: sessions.clone(),
         node_id: node_id.clone(),
         version: crate::CRATE_VERSION.to_string(),
         started: std::time::Instant::now(),
@@ -69,9 +73,14 @@ pub async fn run(cfg: DaemonConfig) -> Result<(), DaemonError> {
         }
     });
 
-    let (router, _endpoint) =
-        main_ep::spawn_main_endpoint(state.clone(), cfg.idle_timeout, &cfg.net_opts, secret_key)
-            .await?;
+    let (router, _endpoint) = main_ep::spawn_main_endpoint(
+        state.clone(),
+        sessions.clone(),
+        cfg.idle_timeout,
+        &cfg.net_opts,
+        secret_key,
+    )
+    .await?;
 
     tracing::info!(
         node_id = %node_id,

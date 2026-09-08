@@ -4,7 +4,9 @@ use thiserror::Error;
 use tokio::sync::Mutex;
 
 use crate::net::NetError;
+use crate::stream_io::{self, FrameIoError};
 use tmite_proto::alpn::DATA_ALPN;
+use tmite_proto::frame::DataFrame;
 use tmite_proto::limits;
 
 #[derive(Debug, Error)]
@@ -19,17 +21,23 @@ pub enum SessionError {
 
 /// Client session: one iroh connection to the server, established eagerly at
 /// startup and re-established after connection-level failures (§7.4).
+///
+/// `hello` is an encoded SESSION frame; it is sent on a dedicated stream
+/// after every successful dial so the daemon's status view knows the
+/// client's announced listeners.
 pub struct Session {
     ep: Endpoint,
     server_id: PublicKey,
+    hello: Vec<u8>,
     conn: Mutex<Option<Connection>>,
 }
 
 impl Session {
-    pub fn new(ep: Endpoint, server_id: PublicKey) -> Self {
+    pub fn new(ep: Endpoint, server_id: PublicKey, hello: Vec<u8>) -> Self {
         Self {
             ep,
             server_id,
+            hello,
             conn: Mutex::new(None),
         }
     }
@@ -51,8 +59,26 @@ impl Session {
 
         // Defensive identity check: iroh guarantees this; assert anyway (§7.4).
         assert_eq!(conn.remote_id(), self.server_id, "pinned NodeId mismatch");
+        if let Err(e) = self.send_hello(&conn).await {
+            return Err(SessionError::Unreachable(format!("session hello: {e}")));
+        }
         *guard = Some(conn.clone());
         Ok(conn)
+    }
+
+    /// Announces the local listeners on a dedicated control stream (§7.2).
+    async fn send_hello(&self, conn: &Connection) -> Result<(), FrameIoError> {
+        let (mut send, mut recv) = conn
+            .open_bi()
+            .await
+            .map_err(|e| FrameIoError::Io(std::io::Error::other(e.to_string())))?;
+        send.write_all(&self.hello)
+            .await
+            .map_err(|e| FrameIoError::Io(std::io::Error::other(e.to_string())))?;
+        let _ = send.finish();
+        stream_io::expect_frame::<DataFrame>(&mut recv, tmite_proto::frame::TYPE_OK, limits::OK_DENY_WAIT)
+            .await?;
+        Ok(())
     }
 
     /// Drops the cached connection after any connection-level failure.

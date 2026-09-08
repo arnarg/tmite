@@ -33,6 +33,7 @@ async fn start_daemon_ipc(dir: &tempfile::TempDir) -> (std::path::PathBuf, Arc<S
     let handle = Arc::new(DaemonHandle {
         state: state.clone(),
         invites,
+        sessions: Default::default(),
         node_id: "ab12".into(),
         version: "0.1.0".into(),
         started: std::time::Instant::now(),

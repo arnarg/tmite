@@ -121,6 +121,7 @@ pub const TYPE_FORWARD: u8 = 0x01;
 pub const TYPE_OK: u8 = 0x02;
 pub const TYPE_DENY: u8 = 0x03;
 pub const TYPE_VALIDATE: u8 = 0x04;
+pub const TYPE_SESSION: u8 = 0x05;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -130,6 +131,15 @@ pub enum DataDenyReason {
     ServerError,
 }
 
+/// One announced local listener in a SESSION frame.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionForward {
+    /// Local bind address as `addr:port` (as given to `--fwd`).
+    pub local: String,
+    /// Forward target as `host:port`.
+    pub target: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum DataFrame {
@@ -137,6 +147,9 @@ pub enum DataFrame {
     Validate { target: String },
     Ok {},
     Deny { reason: DataDenyReason },
+    /// Sent once per connection right after dialing: announces the
+    /// client's active local listeners for the daemon's status view.
+    Session { forwards: Vec<SessionForward> },
 }
 
 impl DataFrame {
@@ -146,6 +159,7 @@ impl DataFrame {
             DataFrame::Validate { .. } => TYPE_VALIDATE,
             DataFrame::Ok { .. } => TYPE_OK,
             DataFrame::Deny { .. } => TYPE_DENY,
+            DataFrame::Session { .. } => TYPE_SESSION,
         }
     }
 }

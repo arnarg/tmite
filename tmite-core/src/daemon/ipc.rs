@@ -8,16 +8,18 @@ use tokio::net::UnixStream;
 use tokio::sync::mpsc;
 
 use crate::daemon::invite::InviteManager;
+use crate::daemon::sessions::Sessions;
 use crate::daemon::state::State;
 use tmite_proto::ipc::{
     self, AllowParams, AllowResult, DecideParams, ErrorCode, InviteParams, InviteResult, LsResult,
-    Method, Reply, Request, RevokeParams, RevokeResult, RmParams, RmResult, StatusResult,
-    StopResult,
+    Method, PeerSessionInfo, Reply, Request, RevokeParams, RevokeResult, RmParams, RmResult,
+    SessionsResult, StatusResult, StopResult,
 };
 
 pub struct DaemonHandle {
     pub state: Arc<State>,
     pub invites: Arc<InviteManager>,
+    pub sessions: Sessions,
     pub node_id: String,
     pub version: String,
     pub started: Instant,
@@ -114,6 +116,7 @@ async fn dispatch(request: Request, handle: Arc<DaemonHandle>, tx: mpsc::Unbound
         Method::PeerLs => dispatch_ls(handle).await,
         Method::PeerRm => dispatch_rm(request, handle).await,
         Method::DaemonStatus => dispatch_status(handle).await,
+        Method::DaemonSessions => dispatch_sessions(handle).await,
         Method::DaemonStop => {
             let _ = handle.stop_tx.send(());
             Ok(json!(StopResult { stopping: true }))
@@ -262,4 +265,17 @@ async fn dispatch_status(handle: Arc<DaemonHandle>) -> Result<serde_json::Value,
         rules: rules.len(),
         invites: handle.invites.pending_count().await,
     }))
+}
+
+async fn dispatch_sessions(handle: Arc<DaemonHandle>) -> Result<serde_json::Value, DispatchError> {
+    let (peers, _) = handle.state.snapshot();
+    let peers = peers
+        .into_iter()
+        .map(|p| PeerSessionInfo {
+            session: handle.sessions.peer_snapshot(&p.node_id),
+            name: p.name,
+            node_id: p.node_id,
+        })
+        .collect();
+    Ok(json!(SessionsResult { peers }))
 }

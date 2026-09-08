@@ -7,25 +7,30 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 
+use crate::daemon::sessions::{AnnouncedForward, SessionEntry, Sessions};
 use crate::daemon::state::State;
 use crate::net::RejectDelay;
 use crate::stream_io::write_frame;
 use tmite_proto::alpn::DATA_ALPN;
-use tmite_proto::frame::{DataDenyReason, DataFrame, TYPE_FORWARD, TYPE_VALIDATE};
+use tmite_proto::frame::{
+    DataDenyReason, DataFrame, TYPE_FORWARD, TYPE_SESSION, TYPE_VALIDATE,
+};
 use tmite_proto::limits;
 
 /// Data-plane protocol handler for the daemon main endpoint (§7.3).
 #[derive(Debug)]
 pub struct DataPlaneHandler {
     state: Arc<State>,
+    sessions: Sessions,
     reject_delay: Mutex<RejectDelay>,
     idle_timeout: Duration,
 }
 
 impl DataPlaneHandler {
-    pub fn new(state: Arc<State>, idle_timeout: Duration) -> Self {
+    pub fn new(state: Arc<State>, sessions: Sessions, idle_timeout: Duration) -> Self {
         Self {
             state,
+            sessions,
             reject_delay: Mutex::new(RejectDelay::new()),
             idle_timeout,
         }
@@ -50,7 +55,12 @@ impl ProtocolHandler for DataPlaneHandler {
         self.reject_delay.lock().await.reset();
         tracing::info!(peer = %peer.name, %node_id, "data-plane session established");
         self.state.touch_last_seen(&node_id);
-        connection_loop(conn, peer.name, self.state.clone(), self.idle_timeout).await;
+
+        let entry = SessionEntry::new(peer.name.clone(), node_id.clone(), conn.clone());
+        self.sessions.register(entry.clone());
+        connection_loop(conn, peer.name, self.state.clone(), self.idle_timeout, entry.clone())
+            .await;
+        self.sessions.unregister(&entry);
         Ok(())
     }
 }
@@ -62,14 +72,16 @@ async fn connection_loop(
     peer_name: String,
     state: Arc<State>,
     idle_timeout: Duration,
+    entry: Arc<SessionEntry>,
 ) {
     loop {
         match conn.accept_bi().await {
             Ok((send, recv)) => {
                 let state = state.clone();
                 let peer_name = peer_name.clone();
+                let entry = entry.clone();
                 tokio::spawn(async move {
-                    handle_stream(send, recv, peer_name, state, idle_timeout).await;
+                    handle_stream(send, recv, peer_name, state, idle_timeout, entry).await;
                 });
             }
             Err(e) => {
@@ -89,6 +101,7 @@ async fn handle_stream(
     peer_name: String,
     state: Arc<State>,
     idle_timeout: Duration,
+    entry: Arc<SessionEntry>,
 ) {
     let (is_forward, target) = match crate::stream_io::read_frame::<DataFrame>(
         &mut recv,
@@ -96,8 +109,34 @@ async fn handle_stream(
     )
     .await
     {
-        Ok((t, DataFrame::Forward { target })) if t == TYPE_FORWARD => (true, target),
-        Ok((t, DataFrame::Validate { target })) if t == TYPE_VALIDATE => (false, target),
+        Ok((t, frame @ DataFrame::Forward { .. })) if t == TYPE_FORWARD => {
+            let DataFrame::Forward { target } = frame else {
+                unreachable!()
+            };
+            (true, target)
+        }
+        Ok((t, frame @ DataFrame::Validate { .. })) if t == TYPE_VALIDATE => {
+            let DataFrame::Validate { target } = frame else {
+                unreachable!()
+            };
+            (false, target)
+        }
+        Ok((t, DataFrame::Session { forwards })) if t == TYPE_SESSION => {
+            tracing::debug!(peer = %peer_name, count = forwards.len(), "session hello");
+            entry.set_forwards(
+                forwards
+                    .into_iter()
+                    .map(|f| AnnouncedForward {
+                        local: f.local,
+                        target: f.target,
+                    })
+                    .collect(),
+            );
+            let mut send = send;
+            let _ = write_frame(&mut send, DataFrame::Ok {}.msg_type(), &DataFrame::Ok {}).await;
+            let _ = send.finish();
+            return;
+        }
         _ => {
             tracing::debug!(peer = %peer_name, "malformed first frame; closing stream");
             return;
@@ -161,7 +200,9 @@ async fn handle_stream(
         return;
     }
     tracing::debug!(peer = %peer_name, %target, "forwarding");
+    entry.forward_open(&target);
     relay(send, recv, tcp, idle_timeout).await;
+    entry.forward_close(&target);
 }
 
 async fn deny(send: SendStream, reason: DataDenyReason) {
@@ -247,6 +288,7 @@ pub async fn pump<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
 /// Builds the daemon's Router with the single data-plane ALPN (§7.2).
 pub async fn spawn_main_endpoint(
     state: Arc<State>,
+    sessions: crate::daemon::sessions::Sessions,
     idle_timeout: Duration,
     net_opts: &crate::net::NetOpts,
     secret_key: iroh::SecretKey,
@@ -259,7 +301,7 @@ pub async fn spawn_main_endpoint(
     )
     .await
     .map_err(|e| super::DaemonError::Endpoint(e.to_string()))?;
-    let handler = DataPlaneHandler::new(state, idle_timeout);
+    let handler = DataPlaneHandler::new(state, sessions, idle_timeout);
     let router = Router::builder(endpoint.clone())
         .accept(DATA_ALPN, handler)
         .spawn();

@@ -213,6 +213,58 @@ pub struct StopResult {
     pub stopping: bool,
 }
 
+// -- daemon.sessions -------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionsResult {
+    /// One row per configured peer, connected or not.
+    pub peers: Vec<PeerSessionInfo>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PeerSessionInfo {
+    pub name: String,
+    pub node_id: String,
+    /// Present only while the peer has a live data-plane connection.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session: Option<SessionInfo>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionInfo {
+    pub connected_secs: u64,
+    /// Announced forwards (SESSION frame); empty if the client predates it.
+    pub forwards: Vec<ForwardInfo>,
+    /// Currently open iroh paths for the connection.
+    pub paths: Vec<PathInfo>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ForwardInfo {
+    pub local: String,
+    pub target: String,
+    /// Streams currently relaying for this target.
+    pub live: usize,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PathKind {
+    Direct,
+    Relay,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PathInfo {
+    pub kind: PathKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub addr: Option<String>,
+    /// Whether iroh's path selector currently sends on this path.
+    pub selected: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rtt_ms: Option<u64>,
+}
+
 /// Methods accepted by the daemon's IPC server.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Method {
@@ -223,6 +275,7 @@ pub enum Method {
     PeerLs,
     PeerRm,
     DaemonStatus,
+    DaemonSessions,
     DaemonStop,
 }
 
@@ -236,6 +289,7 @@ impl Method {
             Method::PeerLs => "peer.ls",
             Method::PeerRm => "peer.rm",
             Method::DaemonStatus => "daemon.status",
+            Method::DaemonSessions => "daemon.sessions",
             Method::DaemonStop => "daemon.stop",
         }
     }
@@ -249,6 +303,7 @@ impl Method {
             "peer.ls" => Method::PeerLs,
             "peer.rm" => Method::PeerRm,
             "daemon.status" => Method::DaemonStatus,
+            "daemon.sessions" => Method::DaemonSessions,
             "daemon.stop" => Method::DaemonStop,
             _ => return None,
         })

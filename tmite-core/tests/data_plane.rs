@@ -8,9 +8,10 @@ use iroh::protocol::Router;
 use iroh::{Endpoint, EndpointAddr, PublicKey, SecretKey};
 use tempfile::TempDir;
 use tmite_core::daemon::main_ep::DataPlaneHandler;
+use tmite_core::daemon::sessions::Sessions;
 use tmite_core::daemon::state::State;
 use tmite_proto::alpn::DATA_ALPN;
-use tmite_proto::frame::{DataDenyReason, DataFrame};
+use tmite_proto::frame::{DataDenyReason, DataFrame, SessionForward};
 
 fn test_state(dir: &TempDir, server_id: &PublicKey) -> (Arc<State>, String) {
     let state = State::load(&dir.path().join("state.toml")).unwrap();
@@ -44,12 +45,17 @@ struct Server {
     _router: Router,
     node_id: PublicKey,
     addr: std::net::SocketAddr,
+    sessions: Sessions,
 }
 
 async fn spawn_server(state: Arc<State>, sk: &SecretKey) -> Server {
     let endpoint = test_endpoint(sk).await;
+    let sessions = Sessions::new();
     let router = Router::builder(endpoint.clone())
-        .accept(DATA_ALPN, DataPlaneHandler::new(state, Duration::ZERO))
+        .accept(
+            DATA_ALPN,
+            DataPlaneHandler::new(state, sessions.clone(), Duration::ZERO),
+        )
         .spawn();
     // Wait for the direct address to be known.
     let addr = loop {
@@ -63,6 +69,7 @@ async fn spawn_server(state: Arc<State>, sk: &SecretKey) -> Server {
         addr,
         endpoint,
         _router: router,
+        sessions,
     }
 }
 
@@ -436,4 +443,75 @@ async fn validate_denied_without_rule() {
         }) => {}
         other => panic!("expected DENY unauthorized, got {other:?}"),
     }
+}
+
+// ---------------------------------------------------------------------------
+// SESSION hello: announces forwards, live count follows relays (§7.2)
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn session_hello_registers_forwards_and_live_counts() {
+    let dir = TempDir::new().unwrap();
+    let (target, _echo) = spawn_echo_target().await;
+    let server_sk = sk_from_byte(17);
+    let client_sk = sk_from_byte(18);
+    let (state, _) = test_state(&dir, &client_sk.public());
+    state.add_rule("laptop", &target).unwrap();
+    let server = spawn_server(state, &server_sk).await;
+    let client_ep = test_endpoint(&client_sk).await;
+    let conn = connect_client(&client_ep, &server).await;
+
+    // Send the SESSION hello on its own stream; the server replies OK.
+    let (mut send, mut recv) = conn.open_bi().await.unwrap();
+    let frame = DataFrame::Session {
+        forwards: vec![SessionForward {
+            local: "127.0.0.1:2222".into(),
+            target: target.clone(),
+        }],
+    };
+    send.write_all(&tmite_proto::frame::encode_frame(frame.msg_type(), &frame).unwrap())
+        .await
+        .unwrap();
+    send.finish().unwrap();
+    let mut header = [0u8; 5];
+    tokio::time::timeout(Duration::from_secs(10), recv.read_exact(&mut header))
+        .await
+        .unwrap()
+        .unwrap();
+    let len = u32::from_be_bytes([header[1], header[2], header[3], header[4]]) as usize;
+    let mut payload = vec![0u8; len];
+    recv.read_exact(&mut payload).await.unwrap();
+    let reply: DataFrame = tmite_proto::frame::decode_payload(&payload).unwrap();
+    assert!(matches!(reply, DataFrame::Ok {}));
+
+    // The registry knows the announced forward, no live streams, and the
+    // (relay or direct) path snapshot is non-empty.
+    let node_hex = client_sk.public().to_string();
+    let info = server
+        .sessions
+        .peer_snapshot(&node_hex)
+        .expect("session registered");
+    assert_eq!(info.forwards.len(), 1);
+    assert_eq!(info.forwards[0].local, "127.0.0.1:2222");
+    assert_eq!(info.forwards[0].target, target);
+    assert_eq!(info.forwards[0].live, 0);
+    assert!(!info.paths.is_empty(), "expected at least one open path");
+
+    // Opening a forwarding stream bumps the live count; closing drops it.
+    let (mut fwd_send, mut fwd_recv, reply) = open_stream(&conn, &target).await.unwrap();
+    assert!(matches!(reply, Some(DataFrame::Ok {})));
+    let info = server.sessions.peer_snapshot(&node_hex).unwrap();
+    assert_eq!(info.forwards[0].live, 1);
+
+    fwd_send.finish().unwrap();
+    let mut buf = Vec::new();
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        tokio::io::AsyncReadExt::read_to_end(&mut fwd_recv, &mut buf),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let info = server.sessions.peer_snapshot(&node_hex).unwrap();
+    assert_eq!(info.forwards[0].live, 0);
 }

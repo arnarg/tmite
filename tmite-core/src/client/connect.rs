@@ -10,8 +10,11 @@ use crate::client::session::{Session, SessionError};
 use crate::fsio::{ClientStore, load_or_create_keypair, servers_toml_path};
 use crate::net::{EndpointRole, NetOpts, build_endpoint};
 use crate::stream_io::{read_frame, write_frame};
+use n0_future::StreamExt;
 use tmite_proto::alpn::DATA_ALPN;
-use tmite_proto::frame::{DataDenyReason, DataFrame, TYPE_FORWARD, TYPE_VALIDATE};
+use tmite_proto::frame::{
+    DataDenyReason, DataFrame, SessionForward, TYPE_FORWARD, TYPE_VALIDATE,
+};
 use tmite_proto::limits;
 
 #[derive(Debug, Error)]
@@ -93,6 +96,8 @@ pub trait ConnectUi: Send + Sync {
     fn info(&self, msg: &str);
     fn warn(&self, msg: &str);
     fn denied(&self, target: &str, reason: &DataDenyReason);
+    /// User-visible transport path change (printed to stdout).
+    fn path(&self, msg: &str);
 }
 
 /// Runs `tmite connect`: binds listeners, connects eagerly, validates each
@@ -120,7 +125,6 @@ pub async fn run(params: ConnectParams) -> Result<(), ConnectError> {
         &params.net_opts,
     )
     .await?;
-    let session = Arc::new(Session::new(endpoint.clone(), server_id));
 
     let mut listeners = Vec::new();
     for spec in &params.specs {
@@ -128,6 +132,22 @@ pub async fn run(params: ConnectParams) -> Result<(), ConnectError> {
         let listener = TcpListener::bind(addr).await?;
         listeners.push((listener, spec.clone()));
     }
+
+    // SESSION hello: announces the bound listeners for the daemon's status
+    // view; sent on every (re)dial by the session (§7.2).
+    let hello = DataFrame::Session {
+        forwards: params
+            .specs
+            .iter()
+            .map(|spec| SessionForward {
+                local: SocketAddr::new(spec.local_addr, spec.local_port).to_string(),
+                target: spec.target.clone(),
+            })
+            .collect(),
+    };
+    let hello = tmite_proto::frame::encode_frame(hello.msg_type(), &hello)
+        .map_err(|e| ConnectError::Session(SessionError::Unreachable(e.to_string())))?;
+    let session = Arc::new(Session::new(endpoint.clone(), server_id, hello));
 
     // Eager connect + per-spec validation: fail fast before entering the
     // accept loop (§7.4).
@@ -142,6 +162,49 @@ pub async fn run(params: ConnectParams) -> Result<(), ConnectError> {
     }
 
     let shutdown = Arc::new(Notify::new());
+
+    // Print transport path changes until the connection drops; re-arm on
+    // re-dial so a fresh connection is watched too.
+    let watch_session = session.clone();
+    let watch_ui: Arc<dyn ConnectUi> = Arc::new(ForwardingUi);
+    let watch_shutdown = shutdown.clone();
+    let mut tasks_path_watch = Vec::new();
+    tasks_path_watch.push(tokio::spawn(async move {
+        loop {
+            let conn = match watch_session.get().await {
+                Ok(conn) => conn,
+                Err(e) => {
+                    watch_ui.warn(&format!("cannot reach server for path watch: {e}"));
+                    return;
+                }
+            };
+            let mut events = conn.path_events();
+            loop {
+                let event = tokio::select! {
+                    _ = watch_shutdown.notified() => return,
+                    event = events.next() => event,
+                };
+                match event {
+                    Some(iroh::endpoint::PathEvent::Opened { remote_addr, .. }) => {
+                        watch_ui.path(&format!("path opened: {remote_addr}"));
+                    }
+                    Some(iroh::endpoint::PathEvent::Selected { remote_addr, .. }) => {
+                        watch_ui.path(&format!("path selected: {remote_addr}"));
+                    }
+                    Some(iroh::endpoint::PathEvent::Closed { remote_addr, .. }) => {
+                        watch_ui.path(&format!("path closed: {remote_addr}"));
+                    }
+                    Some(iroh::endpoint::PathEvent::Lagged { missed, .. }) => {
+                        watch_ui.warn(&format!("path events lagged ({missed} dropped)"));
+                    }
+                    Some(_) => {}
+                    None => break,
+                }
+            }
+            watch_session.invalidate().await;
+        }
+    }));
+
     let mut tasks = Vec::new();
     for (listener, spec) in listeners {
         let session = session.clone();
@@ -177,7 +240,7 @@ pub async fn run(params: ConnectParams) -> Result<(), ConnectError> {
         _ = tokio::signal::ctrl_c() => {}
     }
     shutdown.notify_waiters();
-    for task in tasks {
+    for task in tasks_path_watch.drain(..).chain(tasks.drain(..)) {
         task.abort();
     }
     endpoint.close().await;
@@ -201,6 +264,9 @@ impl ConnectUi for ForwardingUi {
     }
     fn denied(&self, target: &str, reason: &DataDenyReason) {
         tracing::warn!(%target, ?reason, "forward denied");
+    }
+    fn path(&self, msg: &str) {
+        println!("{msg}");
     }
 }
 
