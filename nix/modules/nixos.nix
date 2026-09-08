@@ -71,6 +71,19 @@ in
       '';
     };
 
+    port = lib.mkOption {
+      type = lib.types.nullOr lib.types.port;
+      default = null;
+      example = 42991;
+      description = ''
+        UDP port for the daemon's main tunnel endpoint, passed as
+        `--port`. Set this to a fixed port if a firewall in front of the
+        server needs a static allow rule for inbound iroh traffic. The
+        port is bound on both IPv4 and IPv6. null (the default) lets the
+        OS pick a random port on each start.
+      '';
+    };
+
     relays = lib.mkOption {
       type = lib.types.listOf lib.types.str;
       default = [ ];
@@ -121,6 +134,7 @@ in
         + " --data-dir ${lib.escapeShellArg cfg.dataDir}"
         + " --socket-path ${lib.escapeShellArg cfg.socket}"
         + lib.optionalString (cfg.idleTimeout != 0) " --idle-timeout ${toString cfg.idleTimeout}"
+        + lib.optionalString (cfg.port != null) " --port ${toString cfg.port}"
         + lib.concatMapStrings (r: " --relay ${lib.escapeShellArg r}") cfg.relays
         + lib.optionalString (cfg.pkarr != "") " --pkarr ${lib.escapeShellArg cfg.pkarr}";
     };

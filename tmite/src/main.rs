@@ -47,6 +47,9 @@ enum Command {
         /// Self-hosted pkarr relay for publishing and resolution
         #[arg(long)]
         pkarr: Option<String>,
+        /// UDP port for the main tunnel endpoint (default: random)
+        #[arg(long)]
+        port: Option<u16>,
         /// Per-stream idle timeout in seconds (0 = disabled)
         #[arg(long, default_value_t = 0)]
         idle_timeout: u64,
@@ -119,6 +122,7 @@ async fn main() {
         Command::Daemon {
             relay,
             pkarr,
+            port,
             idle_timeout,
         } => {
             let data_dir = cli
@@ -133,6 +137,7 @@ async fn main() {
                 net_opts: NetOpts {
                     relay_urls: relay.clone(),
                     pkarr_url: pkarr.clone(),
+                    bind_port: *port,
                 },
             })
             .await

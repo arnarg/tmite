@@ -1,3 +1,4 @@
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
 
 use iroh::endpoint::{QuicTransportConfig, RelayMode, VarInt};
@@ -22,6 +23,7 @@ pub enum NetError {
 pub struct NetOpts {
     pub relay_urls: Vec<String>,
     pub pkarr_url: Option<String>,
+    pub bind_port: Option<u16>,
 }
 
 /// Which role an endpoint plays; determines transport tuning.
@@ -90,10 +92,23 @@ pub async fn build_endpoint(
         Endpoint::builder(presets::N0)
     };
 
-    let endpoint = builder
+    let mut builder = builder
         .secret_key(secret_key)
         .alpns(alpns)
-        .transport_config(transport)
+        .transport_config(transport);
+
+    if let Some(port) = opts.bind_port {
+        for addr in [
+            SocketAddr::from((Ipv4Addr::UNSPECIFIED, port)),
+            SocketAddr::from((Ipv6Addr::UNSPECIFIED, port)),
+        ] {
+            builder = builder
+                .bind_addr(addr)
+                .map_err(|e| NetError::Bind(e.to_string()))?;
+        }
+    }
+
+    let endpoint = builder
         .bind()
         .await
         .map_err(|e| NetError::Bind(e.to_string()))?;
