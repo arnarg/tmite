@@ -118,8 +118,6 @@
       devShells = forAllSystems (
         system: pkgs: {
           default = pkgs.mkShell {
-            # nixos-26.05 pins rustc 1.95, matching rust-toolchain.toml
-            # and clearing iroh 1.1.0's MSRV (1.91).
             packages = with pkgs; [
               rustc
               cargo
