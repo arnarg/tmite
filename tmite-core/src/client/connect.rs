@@ -9,9 +9,9 @@ use tokio::sync::Notify;
 use crate::client::session::{Session, SessionError};
 use crate::fsio::{ClientStore, load_or_create_keypair, servers_toml_path};
 use crate::net::{EndpointRole, NetOpts, build_endpoint};
-use crate::stream_io::write_frame;
+use crate::stream_io::{read_frame, write_frame};
 use tmite_proto::alpn::DATA_ALPN;
-use tmite_proto::frame::{DataDenyReason, DataFrame, TYPE_FORWARD};
+use tmite_proto::frame::{DataDenyReason, DataFrame, TYPE_FORWARD, TYPE_VALIDATE};
 use tmite_proto::limits;
 
 #[derive(Debug, Error)]
@@ -24,6 +24,11 @@ pub enum ConnectError {
     Io(#[from] std::io::Error),
     #[error("fs error: {0}")]
     Fs(#[from] crate::fsio::FsError),
+    #[error("forward to {target} not allowed: {reason:?}")]
+    ForwardDenied {
+        target: String,
+        reason: DataDenyReason,
+    },
     #[error("net error: {0}")]
     Net(#[from] crate::net::NetError),
     #[error("session error: {0}")]
@@ -90,7 +95,8 @@ pub trait ConnectUi: Send + Sync {
     fn denied(&self, target: &str, reason: &DataDenyReason);
 }
 
-/// Runs `tmite connect`: binds listeners, lazily dials, relays (§7.4).
+/// Runs `tmite connect`: binds listeners, connects eagerly, validates each
+/// forward (§7.4), then accepts and relays.
 pub async fn run(params: ConnectParams) -> Result<(), ConnectError> {
     let secret_key = load_or_create_keypair(&params.data_dir.join("keypair"))?;
     let store = ClientStore::load(&servers_toml_path(&params.data_dir))?;
@@ -122,6 +128,14 @@ pub async fn run(params: ConnectParams) -> Result<(), ConnectError> {
         let listener = TcpListener::bind(addr).await?;
         listeners.push((listener, spec.clone()));
     }
+
+    // Eager connect + per-spec validation: fail fast before entering the
+    // accept loop (§7.4).
+    let conn = session.get().await?;
+    for spec in &params.specs {
+        validate_forward(&conn, spec).await?;
+    }
+
     let ui: Arc<dyn ConnectUi> = Arc::new(ForwardingUi);
     for (_, spec) in &listeners {
         ui.listening(spec);
@@ -174,7 +188,10 @@ struct ForwardingUi;
 
 impl ConnectUi for ForwardingUi {
     fn listening(&self, spec: &FwdSpec) {
-        tracing::info!(target = %spec.target, local = %spec.local_port, "listening");
+        println!(
+            "listening on {}:{} → {}",
+            spec.local_addr, spec.local_port, spec.target
+        );
     }
     fn info(&self, msg: &str) {
         tracing::info!("{msg}");
@@ -184,6 +201,41 @@ impl ConnectUi for ForwardingUi {
     }
     fn denied(&self, target: &str, reason: &DataDenyReason) {
         tracing::warn!(%target, ?reason, "forward denied");
+    }
+}
+
+/// Startup fail-fast probe: asks the server whether `spec.target` would be
+/// allowed, without dialing it (VALIDATE frame, §7.2).
+async fn validate_forward(conn: &iroh::endpoint::Connection, spec: &FwdSpec) -> Result<(), ConnectError> {
+    let (mut send, mut recv) = conn
+        .open_bi()
+        .await
+        .map_err(|e| ConnectError::Session(SessionError::Unreachable(e.to_string())))?;
+
+    write_frame(
+        &mut send,
+        TYPE_VALIDATE,
+        &DataFrame::Validate {
+            target: spec.target.clone(),
+        },
+    )
+    .await
+    .map_err(|e| ConnectError::Session(SessionError::Unreachable(e.to_string())))?;
+
+    let _ = send.finish();
+    let reply = read_frame::<DataFrame>(&mut recv, limits::OK_DENY_WAIT)
+        .await
+        .map_err(|e| ConnectError::Session(SessionError::Unreachable(e.to_string())))?;
+
+    match reply {
+        (_, DataFrame::Ok {}) => Ok(()),
+        (_, DataFrame::Deny { reason }) => Err(ConnectError::ForwardDenied {
+            target: spec.target.clone(),
+            reason,
+        }),
+        _ => Err(ConnectError::Session(SessionError::Unreachable(
+            "unexpected reply to VALIDATE".into(),
+        ))),
     }
 }
 

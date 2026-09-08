@@ -104,6 +104,39 @@ async fn open_stream(
     Ok((send, recv, reply))
 }
 
+/// Opens one data stream: sends VALIDATE (ACL probe, no dial), returns the
+/// stream pair after reading the server's reply (Ok or Deny).
+async fn open_validate_stream(
+    conn: &iroh::endpoint::Connection,
+    target: &str,
+) -> Result<
+    (
+        iroh::endpoint::SendStream,
+        iroh::endpoint::RecvStream,
+        Option<DataFrame>,
+    ),
+    Box<dyn std::error::Error>,
+> {
+    let (mut send, mut recv) = conn.open_bi().await?;
+    let frame = DataFrame::Validate {
+        target: target.to_string(),
+    };
+    let bytes = tmite_proto::frame::encode_frame(frame.msg_type(), &frame)?;
+    send.write_all(&bytes).await?;
+    let mut header = [0u8; 5];
+    let reply =
+        match tokio::time::timeout(Duration::from_secs(10), recv.read_exact(&mut header)).await {
+            Ok(Ok(_)) => {
+                let len = u32::from_be_bytes([header[1], header[2], header[3], header[4]]) as usize;
+                let mut payload = vec![0u8; len];
+                recv.read_exact(&mut payload).await?;
+                Some(tmite_proto::frame::decode_payload::<DataFrame>(&payload)?)
+            }
+            _ => None,
+        };
+    Ok((send, recv, reply))
+}
+
 fn sk_from_byte(b: u8) -> SecretKey {
     let mut seed = [b; 32];
     seed[31] = b;
@@ -349,4 +382,58 @@ async fn malformed_forward_does_not_kill_connection() {
     // Connection must still be usable.
     let (_s2, _r2, reply) = open_stream(&conn, &target).await.unwrap();
     assert!(matches!(reply, Some(DataFrame::Ok {})));
+}
+
+// ---------------------------------------------------------------------------
+// VALIDATE probes: ACL answer without dialing the target (§7.2, §7.4)
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn validate_allowed_does_not_dial_target() {
+    let dir = TempDir::new().unwrap();
+    let server_sk = sk_from_byte(13);
+    let client_sk = sk_from_byte(14);
+    let (state, _) = test_state(&dir, &client_sk.public());
+    // Rule exists, but the target is not listening: a FORWARD would deny with
+    // TargetUnreachable. VALIDATE must answer OK without ever dialing.
+    state.add_rule("laptop", "127.0.0.1:1").unwrap();
+    let server = spawn_server(state, &server_sk).await;
+    let client_ep = test_endpoint(&client_sk).await;
+    let conn = connect_client(&client_ep, &server).await;
+
+    let (_send, _recv, reply) = open_validate_stream(&conn, "127.0.0.1:1")
+        .await
+        .unwrap();
+    assert!(matches!(reply, Some(DataFrame::Ok {})));
+
+    // Sanity: the same target via FORWARD does dial and denies.
+    let (_s, _r, fwd_reply) = open_stream(&conn, "127.0.0.1:1").await.unwrap();
+    match fwd_reply {
+        Some(DataFrame::Deny {
+            reason: DataDenyReason::TargetUnreachable { .. },
+        }) => {}
+        other => panic!("expected DENY target_unreachable, got {other:?}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn validate_denied_without_rule() {
+    let dir = TempDir::new().unwrap();
+    let server_sk = sk_from_byte(15);
+    let client_sk = sk_from_byte(16);
+    let (state, _) = test_state(&dir, &client_sk.public());
+    state.add_rule("laptop", "127.0.0.1:22").unwrap();
+    let server = spawn_server(state, &server_sk).await;
+    let client_ep = test_endpoint(&client_sk).await;
+    let conn = connect_client(&client_ep, &server).await;
+
+    let (_send, _recv, reply) = open_validate_stream(&conn, "10.0.0.1:80")
+        .await
+        .unwrap();
+    match reply {
+        Some(DataFrame::Deny {
+            reason: DataDenyReason::Unauthorized,
+        }) => {}
+        other => panic!("expected DENY unauthorized, got {other:?}"),
+    }
 }

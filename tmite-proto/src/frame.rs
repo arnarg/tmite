@@ -120,6 +120,7 @@ impl PairingFrame {
 pub const TYPE_FORWARD: u8 = 0x01;
 pub const TYPE_OK: u8 = 0x02;
 pub const TYPE_DENY: u8 = 0x03;
+pub const TYPE_VALIDATE: u8 = 0x04;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -133,6 +134,7 @@ pub enum DataDenyReason {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum DataFrame {
     Forward { target: String },
+    Validate { target: String },
     Ok {},
     Deny { reason: DataDenyReason },
 }
@@ -141,6 +143,7 @@ impl DataFrame {
     pub const fn msg_type(&self) -> u8 {
         match self {
             DataFrame::Forward { .. } => TYPE_FORWARD,
+            DataFrame::Validate { .. } => TYPE_VALIDATE,
             DataFrame::Ok { .. } => TYPE_OK,
             DataFrame::Deny { .. } => TYPE_DENY,
         }

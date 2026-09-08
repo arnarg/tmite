@@ -84,6 +84,9 @@ pub struct InviteShared {
     request_id: u64,
     delay: Mutex<RejectDelay>,
     peer_recorded: Mutex<bool>,
+    /// The daemon's main-endpoint identity, delivered to the client in
+    /// `PAIR_CONFIRM` so it can pin and dial the right node (§5, §10.3).
+    server_node_id: PublicKey,
     entries: Entries,
 }
 
@@ -114,14 +117,16 @@ impl InviteShared {
 pub struct InviteManager {
     net_opts: NetOpts,
     state: Arc<State>,
+    server_node_id: PublicKey,
     entries: Entries,
 }
 
 impl InviteManager {
-    pub fn new(net_opts: NetOpts, state: Arc<State>) -> Self {
+    pub fn new(net_opts: NetOpts, state: Arc<State>, server_node_id: PublicKey) -> Self {
         Self {
             net_opts,
             state,
+            server_node_id,
             entries: Arc::new(Mutex::new(std::collections::HashMap::new())),
         }
     }
@@ -191,6 +196,7 @@ impl InviteManager {
             request_id,
             delay: Mutex::new(RejectDelay::new()),
             peer_recorded: Mutex::new(false),
+            server_node_id: self.server_node_id,
             entries: self.entries.clone(),
         });
 
@@ -489,7 +495,7 @@ async fn handle_pair_conn(conn: Connection, shared: Arc<InviteShared>) {
                             shared.delay.lock().await.reset();
                         }
                         let frame = PairingFrame::PairConfirm {
-                            node_id: *remote.as_bytes(),
+                            node_id: *shared.server_node_id.as_bytes(),
                             name: shared.name.clone(),
                         };
                         let _ = write_frame(&mut send, frame.msg_type(), &frame).await;
@@ -514,7 +520,7 @@ async fn handle_pair_conn(conn: Connection, shared: Arc<InviteShared>) {
             } else {
                 drop(recorded);
                 let frame = PairingFrame::PairConfirm {
-                    node_id: *remote.as_bytes(),
+                    node_id: *shared.server_node_id.as_bytes(),
                     name: shared.name.clone(),
                 };
                 let _ = write_frame(&mut send, frame.msg_type(), &frame).await;

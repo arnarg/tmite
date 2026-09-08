@@ -24,7 +24,11 @@ async fn start_daemon_ipc(dir: &tempfile::TempDir) -> (std::path::PathBuf, Arc<S
             last_seen: "t".into(),
         })
         .unwrap();
-    let invites = Arc::new(InviteManager::new(Default::default(), state.clone()));
+    let invites = Arc::new(InviteManager::new(
+        Default::default(),
+        state.clone(),
+        iroh::SecretKey::from_bytes(&[7u8; 32]).public(),
+    ));
     let (stop_tx, _stop_rx) = mpsc::unbounded_channel();
     let handle = Arc::new(DaemonHandle {
         state: state.clone(),

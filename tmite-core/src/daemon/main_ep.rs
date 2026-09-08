@@ -9,9 +9,9 @@ use tokio::sync::Mutex;
 
 use crate::daemon::state::State;
 use crate::net::RejectDelay;
-use crate::stream_io::{expect_frame, write_frame};
+use crate::stream_io::write_frame;
 use tmite_proto::alpn::DATA_ALPN;
-use tmite_proto::frame::{DataDenyReason, DataFrame, TYPE_FORWARD};
+use tmite_proto::frame::{DataDenyReason, DataFrame, TYPE_FORWARD, TYPE_VALIDATE};
 use tmite_proto::limits;
 
 /// Data-plane protocol handler for the daemon main endpoint (§7.3).
@@ -80,7 +80,9 @@ async fn connection_loop(
     }
 }
 
-/// Per-stream handler: one FORWARD, ACL check, dial, relay.
+/// Per-stream handler: one FORWARD or VALIDATE, ACL check, dial, relay.
+/// VALIDATE answers OK/DENY from the ACL alone (no dial) so clients can
+/// fail fast at connect time.
 async fn handle_stream(
     send: SendStream,
     mut recv: RecvStream,
@@ -88,15 +90,19 @@ async fn handle_stream(
     state: Arc<State>,
     idle_timeout: Duration,
 ) {
-    let target =
-        match expect_frame::<DataFrame>(&mut recv, TYPE_FORWARD, limits::FIRST_FRAME_TIMEOUT).await
-        {
-            Ok(DataFrame::Forward { target }) => target,
-            Ok(_) | Err(_) => {
-                tracing::debug!(peer = %peer_name, "malformed first frame; closing stream");
-                return;
-            }
-        };
+    let (is_forward, target) = match crate::stream_io::read_frame::<DataFrame>(
+        &mut recv,
+        limits::FIRST_FRAME_TIMEOUT,
+    )
+    .await
+    {
+        Ok((t, DataFrame::Forward { target })) if t == TYPE_FORWARD => (true, target),
+        Ok((t, DataFrame::Validate { target })) if t == TYPE_VALIDATE => (false, target),
+        _ => {
+            tracing::debug!(peer = %peer_name, "malformed first frame; closing stream");
+            return;
+        }
+    };
 
     if !valid_target(&target) {
         deny(send, DataDenyReason::ServerError).await;
@@ -107,6 +113,14 @@ async fn handle_stream(
     if !state.rule_allows(&peer_name, &target) {
         tracing::info!(peer = %peer_name, %target, "forward denied: no rule");
         deny(send, DataDenyReason::Unauthorized).await;
+        return;
+    }
+
+    if !is_forward {
+        tracing::debug!(peer = %peer_name, %target, "validate: allowed");
+        let mut send = send;
+        let _ = write_frame(&mut send, DataFrame::Ok {}.msg_type(), &DataFrame::Ok {}).await;
+        let _ = send.finish();
         return;
     }
 

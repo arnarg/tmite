@@ -555,12 +555,12 @@ async fn connect_cmd(cli: &Cli, name: String, fwd: Vec<String>) -> anyhow::Resul
         specs.push(parse_fwd_spec(&spec)?);
     }
     let params = ConnectParams {
-        name,
+        name: name.clone(),
         specs,
         data_dir: client_data_dir(cli)?,
         net_opts: NetOpts::default(),
     };
-    println!("Connecting... (first connection through a cold tunnel may take a few seconds)");
+    println!("Connecting to {name}...");
     tmite_core::client::connect::run(params)
         .await
         .map_err(anyhow::Error::from)

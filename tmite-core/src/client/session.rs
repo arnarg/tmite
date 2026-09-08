@@ -17,8 +17,8 @@ pub enum SessionError {
     Net(#[from] NetError),
 }
 
-/// Client session: one iroh connection to the server, lazily established and
-/// re-established after connection-level failures (§7.4).
+/// Client session: one iroh connection to the server, established eagerly at
+/// startup and re-established after connection-level failures (§7.4).
 pub struct Session {
     ep: Endpoint,
     server_id: PublicKey,
@@ -34,8 +34,8 @@ impl Session {
         }
     }
 
-    /// Returns a live connection, dialing first if needed. The dial is lazy:
-    /// the first forwarded TCP conn pays the hole-punch cost.
+    /// Returns a live connection, dialing first if needed. Called eagerly at
+    /// startup; later calls re-dial only after connection-level failures.
     pub async fn get(&self) -> Result<Connection, SessionError> {
         let mut guard = self.conn.lock().await;
         if let Some(conn) = guard.as_ref() {

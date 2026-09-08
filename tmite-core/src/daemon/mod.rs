@@ -45,7 +45,11 @@ pub async fn run(cfg: DaemonConfig) -> Result<(), DaemonError> {
     let node_id = secret_key.public().to_string();
 
     let state = Arc::new(State::load(&cfg.data_dir.join("state.toml"))?);
-    let invites = Arc::new(InviteManager::new(cfg.net_opts.clone(), state.clone()));
+    let invites = Arc::new(InviteManager::new(
+        cfg.net_opts.clone(),
+        state.clone(),
+        secret_key.public(),
+    ));
 
     let (stop_tx, mut stop_rx) = mpsc::unbounded_channel();
     let handle = Arc::new(DaemonHandle {

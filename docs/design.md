@@ -285,8 +285,9 @@ Control payloads are JSON via `serde_json`; limits: control frames ≤ 4 KiB (ov
 | 0x01 | `FORWARD` | `{ target: String }` | client → server, first frame on each stream |
 | 0x02 | `OK` | `{}` | server → client |
 | 0x03 | `DENY` | `{ reason: Reason }` | server → client |
+| 0x04 | `VALIDATE` | `{ target: String }` | client → server, ACL probe without dialing |
 
-`Reason`: `Unauthorized` (peer has no rule for this target), `TargetUnreachable` (dial failed — include `os_error` string), `ServerError`. Each stream carries exactly one `FORWARD`.
+`Reason`: `Unauthorized` (peer has no rule for this target), `TargetUnreachable` (dial failed — include `os_error` string), `ServerError`. Each stream carries exactly one `FORWARD` (or one `VALIDATE`).
 
 There are **no `PING`/`PONG` frames.** Connection maintenance is QUIC's job: the client's transport config sets a keep-alive interval (~15 s) and a generous max idle timeout; the server relies on QUIC keepalives plus the per-read deadlines below. Application-level pings would duplicate the transport and drift out of sync with it.
 
@@ -300,10 +301,11 @@ Connection level (once per iroh connection):
 
 Stream level (per bidirectional stream):
 
-1. Read one `FORWARD` (30 s bound from stream open; over-limit or malformed frame → close stream).
+1. Read one `FORWARD` or `VALIDATE` (30 s bound from stream open; over-limit, unexpected type, or malformed frame → close stream).
 2. ACL check: exact-match the target string (§8) against that peer's rules. No match → send `DENY { Unauthorized }`, `finish()` the stream, done. **The connection survives a denial.**
-3. `TcpStream::connect(target)` (connect timeout **10 s**) → on failure `DENY { TargetUnreachable }`, finish stream.
-4. `OK`, then relay (§7.5). Update `peers.last_seen` at connection establishment (batched writes are fine; persistence of this field may lag).
+3. For `VALIDATE`, the ACL check is the whole job: allowed → `OK`, `finish()` the stream, done. The target is **not** dialed; a probe must never touch the target system.
+4. For `FORWARD`: `TcpStream::connect(target)` (connect timeout **10 s**) → on failure `DENY { TargetUnreachable }`, finish stream.
+5. `OK`, then relay (§7.5). Update `peers.last_seen` at connection establishment (batched writes are fine; persistence of this field may lag).
 
 Implementation rules:
 
@@ -317,9 +319,10 @@ Implementation rules:
 
 Listeners bind at startup (fail fast on port conflicts). The client wraps the server connection in a session type with state `Idle | Connecting | Connected(Connection)` behind a mutex:
 
-- **Lazy establishment:** the first accepted TCP conn triggers the dial (hole punch, relay fallback — potentially seconds; document that the first connection through a cold tunnel is slow, subsequent are fast). No eager dial at startup; if nothing connects to the listener, nothing dials.
-- **Per accepted TCP conn:** if `Connected`, `open_bi()`; if `Idle` or the handle is dead, dial first. Send `FORWARD`, await `OK`/`DENY` (30 s bound), relay.
-- **Error handling:** on any *connection-level* failure (open fails, keepalive timeout, connection dropped), reset the session handle to `Idle`, log warn, and let the *next* accepted TCP conn re-dial. *Per-stream* errors (denial, target unreachable) never touch session state. Local TCP conns that hit a failed session are closed (SSH sees connection refused mid-handshake); no automatic retry loop in v0.1 — the local client reconnecting is the natural retry.
+- **Eager establishment:** `connect` dials the server immediately at startup (bounded by the online/dial timeouts) and then validates every requested forward before entering the accept loop: for each spec it opens a stream, sends `VALIDATE { target }`, and awaits `OK`/`DENY` (30 s bound). Any dial or validation failure aborts the command with a non-zero exit — an unauthorized or unreachable target fails fast on the command line instead of surfacing only when a local connection arrives.
+- On success the client prints one `listening on <addr>:<port> → <target>` line per spec to stdout; `Ctrl-C` tears down.
+- The server-side ACL remains authoritative at `FORWARD` time: rules may change while the client runs, and a later `FORWARD` can still be denied even though `VALIDATE` passed.
+- **Re-dial on demand after failures:** if the connection drops later, per-stream handlers reset the session handle to `Idle` and the next accepted TCP conn re-dials; the startup probe is not repeated. Per-stream errors (denial, target unreachable) never touch session state. Local TCP conns that hit a failed session are closed (SSH sees connection refused mid-handshake); no automatic retry loop in v0.1 — the local client reconnecting is the natural retry.
 - **Defensive identity check:** assert `conn.remote_id()` equals the pinned NodeId (iroh already guarantees this; the assert is cheap insurance).
 - `Ctrl-C` → graceful: close listeners, close the connection. QUIC propagates connection close to all streams.
 
@@ -494,8 +497,8 @@ tmite/
 │       │   └── ipc.rs        # unix socket server, dispatch, event fanout
 │       └── client/
 │           ├── pair.rs       # `pair` flow
-│           ├── session.rs    # Session type: Idle/Connecting/Connected, lazy dial, reconnect
-│           └── connect.rs    # listeners, per-conn open_bi, relay
+│           ├── session.rs    # Session type: Idle/Connecting/Connected, eager dial at startup, reconnect
+│           └── connect.rs    # listeners, startup VALIDATE probes, per-conn open_bi, relay
 └── tmite/                # bin: clap parsing, prompt (/dev/tty), printing, exit codes
 ```
 
