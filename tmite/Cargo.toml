@@ -13,6 +13,8 @@ tmite-core.workspace = true
 tmite-proto.workspace = true
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"
+dialoguer = "0.12"
+console = "0.16"
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

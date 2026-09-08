@@ -1,4 +1,3 @@
-use std::io::Write as _;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicI32, Ordering};
 
@@ -444,20 +443,16 @@ async fn invite_cmd(
 }
 
 fn prompt_y_n() -> anyhow::Result<bool> {
-    print!("Pair this client? [y/N] ");
-    let _ = std::io::stdout().flush();
     // Read from /dev/tty so piped input cannot auto-confirm (§9.3).
-    use std::io::BufRead;
-    let mut tty = std::io::BufReader::new(
-        std::fs::File::open("/dev/tty")
-            .context("no TTY available for confirmation; pass --yes for scripting")?,
-    );
-    let mut line = String::new();
-    tty.read_line(&mut line)?;
-    match line.trim().to_ascii_lowercase().as_str() {
-        "y" | "yes" => Ok(true),
-        _ => Ok(false),
-    }
+    let tty = std::fs::File::open("/dev/tty")
+        .context("no TTY available for confirmation; pass --yes for scripting")?;
+    let term = console::Term::read_write_pair(tty, std::io::stderr());
+    let accept = dialoguer::Confirm::new()
+        .with_prompt("Pair this client?")
+        .default(false)
+        .wait_for_newline(true)
+        .interact_on(&term)?;
+    Ok(accept)
 }
 
 fn grouped_node_id(node_id: &str) -> String {
@@ -568,8 +563,8 @@ fn print_sessions_table(result: &tmite_proto::ipc::SessionsResult) {
         .unwrap_or(0);
 
     println!(
-        "{:<name_w$}  {:<node_w$}  {:<proxy_w$}  {}",
-        "NAME", "NODE ID", "PROXIES", "STATE"
+        "{:<name_w$}  {:<node_w$}  {:<proxy_w$}  STATE",
+        "NAME", "NODE ID", "PROXIES"
     );
     for row in &rows {
         let lines = row.proxies.len().max(row.state.len());
@@ -676,11 +671,10 @@ async fn pair_cmd(cli: &Cli, code: Option<String>, name: Option<String>) -> anyh
 }
 
 fn prompt_code() -> anyhow::Result<String> {
-    print!("Enter the pairing code: ");
-    let _ = std::io::stdout().flush();
-    let mut line = String::new();
-    std::io::stdin().read_line(&mut line)?;
-    Ok(line.trim().to_string())
+    let code: String = dialoguer::Input::new()
+        .with_prompt("Enter the pairing code")
+        .interact_text()?;
+    Ok(code.trim().to_string())
 }
 
 async fn connect_cmd(cli: &Cli, name: String, fwd: Vec<String>) -> anyhow::Result<()> {
