@@ -544,11 +544,16 @@ fn print_sessions_table(result: &tmite_proto::ipc::SessionsResult) {
 
     let name_w = rows
         .iter()
-        .map(|r| r.name.len())
+        .map(|r| r.name.chars().count())
         .chain(std::iter::once("NAME".len()))
         .max()
         .unwrap_or(0);
-    let node_w = "NODE ID".len();
+    let node_w = rows
+        .iter()
+        .map(|r| r.node_id.chars().count())
+        .chain(std::iter::once("NODE ID".len()))
+        .max()
+        .unwrap_or(0);
     let proxy_w = rows
         .iter()
         .flat_map(|r| &r.proxies)
