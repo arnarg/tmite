@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use iroh::endpoint::{Connection, RecvStream, SendStream};
@@ -12,9 +13,7 @@ use crate::daemon::state::State;
 use crate::net::RejectDelay;
 use crate::stream_io::write_frame;
 use tmite_proto::alpn::DATA_ALPN;
-use tmite_proto::frame::{
-    DataDenyReason, DataFrame, TYPE_FORWARD, TYPE_SESSION, TYPE_VALIDATE,
-};
+use tmite_proto::frame::{DataDenyReason, DataFrame, TYPE_FORWARD, TYPE_SESSION, TYPE_VALIDATE};
 use tmite_proto::limits;
 
 /// Data-plane protocol handler for the daemon main endpoint (§7.3).
@@ -58,8 +57,14 @@ impl ProtocolHandler for DataPlaneHandler {
 
         let entry = SessionEntry::new(peer.name.clone(), node_id.clone(), conn.clone());
         self.sessions.register(entry.clone());
-        connection_loop(conn, peer.name, self.state.clone(), self.idle_timeout, entry.clone())
-            .await;
+        connection_loop(
+            conn,
+            peer.name,
+            self.state.clone(),
+            self.idle_timeout,
+            entry.clone(),
+        )
+        .await;
         self.sessions.unregister(&entry);
         Ok(())
     }
@@ -103,45 +108,44 @@ async fn handle_stream(
     idle_timeout: Duration,
     entry: Arc<SessionEntry>,
 ) {
-    let (is_forward, target) = match crate::stream_io::read_frame::<DataFrame>(
-        &mut recv,
-        limits::FIRST_FRAME_TIMEOUT,
-    )
-    .await
-    {
-        Ok((t, frame @ DataFrame::Forward { .. })) if t == TYPE_FORWARD => {
-            let DataFrame::Forward { target } = frame else {
-                unreachable!()
-            };
-            (true, target)
-        }
-        Ok((t, frame @ DataFrame::Validate { .. })) if t == TYPE_VALIDATE => {
-            let DataFrame::Validate { target } = frame else {
-                unreachable!()
-            };
-            (false, target)
-        }
-        Ok((t, DataFrame::Session { forwards })) if t == TYPE_SESSION => {
-            tracing::debug!(peer = %peer_name, count = forwards.len(), "session hello");
-            entry.set_forwards(
-                forwards
-                    .into_iter()
-                    .map(|f| AnnouncedForward {
-                        local: f.local,
-                        target: f.target,
-                    })
-                    .collect(),
-            );
-            let mut send = send;
-            let _ = write_frame(&mut send, DataFrame::Ok {}.msg_type(), &DataFrame::Ok {}).await;
-            let _ = send.finish();
-            return;
-        }
-        _ => {
-            tracing::debug!(peer = %peer_name, "malformed first frame; closing stream");
-            return;
-        }
-    };
+    let (is_forward, target) =
+        match crate::stream_io::read_frame::<DataFrame>(&mut recv, limits::FIRST_FRAME_TIMEOUT)
+            .await
+        {
+            Ok((t, frame @ DataFrame::Forward { .. })) if t == TYPE_FORWARD => {
+                let DataFrame::Forward { target } = frame else {
+                    unreachable!()
+                };
+                (true, target)
+            }
+            Ok((t, frame @ DataFrame::Validate { .. })) if t == TYPE_VALIDATE => {
+                let DataFrame::Validate { target } = frame else {
+                    unreachable!()
+                };
+                (false, target)
+            }
+            Ok((t, DataFrame::Session { forwards })) if t == TYPE_SESSION => {
+                tracing::debug!(peer = %peer_name, count = forwards.len(), "session hello");
+                entry.set_forwards(
+                    forwards
+                        .into_iter()
+                        .map(|f| AnnouncedForward {
+                            local: f.local,
+                            target: f.target,
+                        })
+                        .collect(),
+                );
+                let mut send = send;
+                let _ =
+                    write_frame(&mut send, DataFrame::Ok {}.msg_type(), &DataFrame::Ok {}).await;
+                let _ = send.finish();
+                return;
+            }
+            _ => {
+                tracing::debug!(peer = %peer_name, "malformed first frame; closing stream");
+                return;
+            }
+        };
 
     if !valid_target(&target) {
         deny(send, DataDenyReason::ServerError).await;
@@ -280,6 +284,38 @@ pub async fn pump<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         if n == 0 {
             return Ok(());
         }
+        w.write_all(&buf[..n]).await?;
+        w.flush().await?;
+    }
+}
+
+/// Like [`pump`], but counts copied bytes into `counter` (payload direction
+/// accounting for the connect TUI).
+pub async fn pump_counted<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
+    r: &mut R,
+    w: &mut W,
+    idle_timeout: Duration,
+    counter: &AtomicU64,
+) -> std::io::Result<()> {
+    let mut buf = [0u8; 8192];
+    loop {
+        let n = if idle_timeout.is_zero() {
+            r.read(&mut buf).await?
+        } else {
+            match tokio::time::timeout(idle_timeout, r.read(&mut buf)).await {
+                Ok(res) => res?,
+                Err(_) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "idle timeout",
+                    ));
+                }
+            }
+        };
+        if n == 0 {
+            return Ok(());
+        }
+        counter.fetch_add(n as u64, Ordering::Relaxed);
         w.write_all(&buf[..n]).await?;
         w.flush().await?;
     }

@@ -408,9 +408,7 @@ async fn validate_allowed_does_not_dial_target() {
     let client_ep = test_endpoint(&client_sk).await;
     let conn = connect_client(&client_ep, &server).await;
 
-    let (_send, _recv, reply) = open_validate_stream(&conn, "127.0.0.1:1")
-        .await
-        .unwrap();
+    let (_send, _recv, reply) = open_validate_stream(&conn, "127.0.0.1:1").await.unwrap();
     assert!(matches!(reply, Some(DataFrame::Ok {})));
 
     // Sanity: the same target via FORWARD does dial and denies.
@@ -434,9 +432,7 @@ async fn validate_denied_without_rule() {
     let client_ep = test_endpoint(&client_sk).await;
     let conn = connect_client(&client_ep, &server).await;
 
-    let (_send, _recv, reply) = open_validate_stream(&conn, "10.0.0.1:80")
-        .await
-        .unwrap();
+    let (_send, _recv, reply) = open_validate_stream(&conn, "10.0.0.1:80").await.unwrap();
     match reply {
         Some(DataFrame::Deny {
             reason: DataDenyReason::Unauthorized,

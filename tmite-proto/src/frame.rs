@@ -143,13 +143,21 @@ pub struct SessionForward {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum DataFrame {
-    Forward { target: String },
-    Validate { target: String },
+    Forward {
+        target: String,
+    },
+    Validate {
+        target: String,
+    },
     Ok {},
-    Deny { reason: DataDenyReason },
+    Deny {
+        reason: DataDenyReason,
+    },
     /// Sent once per connection right after dialing: announces the
     /// client's active local listeners for the daemon's status view.
-    Session { forwards: Vec<SessionForward> },
+    Session {
+        forwards: Vec<SessionForward>,
+    },
 }
 
 impl DataFrame {

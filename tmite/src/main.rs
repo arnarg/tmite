@@ -1,4 +1,6 @@
+use std::io::IsTerminal;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicI32, Ordering};
 
 use anyhow::{Context, bail};
@@ -10,6 +12,9 @@ use tmite_core::fsio::{
     candidate_socket_paths, default_client_data_dir, default_socket_path, load_or_create_keypair,
 };
 use tmite_core::net::{NetOpts, grouped_hex};
+use tokio::sync::{Notify, mpsc};
+
+mod tui;
 
 static EXIT_CODE: AtomicI32 = AtomicI32::new(0);
 
@@ -78,6 +83,10 @@ enum Command {
         /// Forward spec: [LOCAL_ADDR:]LOCAL_PORT:TARGET (repeatable)
         #[arg(long = "fwd")]
         fwd: Vec<String>,
+        /// Disable the live TUI (paths, forwards, connections); implied
+        /// when stdout is not a terminal
+        #[arg(long)]
+        no_tui: bool,
     },
     /// Print this node's iroh NodeId
     NodeId,
@@ -115,7 +124,15 @@ enum PeerCmd {
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
-    init_tracing(cli.verbose);
+    // In TUI mode the subscriber's stderr output would corrupt the inline
+    // viewport; user-visible warnings reach the TUI via UiEvent::Notice.
+    let tui_mode = match &cli.command {
+        Command::Connect { no_tui, .. } => !*no_tui && std::io::stdout().is_terminal(),
+        _ => false,
+    };
+    if !tui_mode {
+        init_tracing(cli.verbose);
+    }
 
     let result = match &cli.command {
         Command::Daemon {
@@ -145,7 +162,9 @@ async fn main() {
         Command::Peer { cmd } => peer_cmd(cli.clone(), cmd.clone()).await,
         Command::Status => status_cmd(&cli).await,
         Command::Pair { code, name, .. } => pair_cmd(&cli, code.clone(), name.clone()).await,
-        Command::Connect { name, fwd } => connect_cmd(&cli, name.clone(), fwd.clone()).await,
+        Command::Connect { name, fwd, no_tui } => {
+            connect_cmd(&cli, name.clone(), fwd.clone(), *no_tui).await
+        }
         Command::NodeId => node_id_cmd(&cli),
     };
 
@@ -522,7 +541,11 @@ fn print_sessions_table(result: &tmite_proto::ipc::SessionsResult) {
                             .rtt_ms
                             .map(|ms| format!(" ({ms}ms)"))
                             .unwrap_or_default();
-                        let mark = if path.selected { "\u{25cf}" } else { "\u{25cb}" };
+                        let mark = if path.selected {
+                            "\u{25cf}"
+                        } else {
+                            "\u{25cb}"
+                        };
                         format!("{mark} {kind}{addr}{rtt}")
                     })
                     .collect(),
@@ -677,7 +700,12 @@ fn prompt_code() -> anyhow::Result<String> {
     Ok(code.trim().to_string())
 }
 
-async fn connect_cmd(cli: &Cli, name: String, fwd: Vec<String>) -> anyhow::Result<()> {
+async fn connect_cmd(
+    cli: &Cli,
+    name: String,
+    fwd: Vec<String>,
+    no_tui: bool,
+) -> anyhow::Result<()> {
     if fwd.is_empty() {
         bail!("at least one --fwd spec is required");
     }
@@ -685,16 +713,34 @@ async fn connect_cmd(cli: &Cli, name: String, fwd: Vec<String>) -> anyhow::Resul
     for spec in fwd {
         specs.push(parse_fwd_spec(&spec)?);
     }
-    let params = ConnectParams {
+    let shutdown = Arc::new(Notify::new());
+    let base = ConnectParams {
         name: name.clone(),
-        specs,
+        specs: specs.clone(),
         data_dir: client_data_dir(cli)?,
         net_opts: NetOpts::default(),
+        events: None,
+        shutdown: shutdown.clone(),
     };
-    println!("Connecting to {name}...");
-    tmite_core::client::connect::run(params)
-        .await
-        .map_err(anyhow::Error::from)
+    let use_tui = !no_tui && std::io::stdout().is_terminal();
+    if use_tui {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let params = ConnectParams {
+            events: Some(tx),
+            ..base
+        };
+        let n_forwards = params.specs.len();
+        let tui_task = tokio::spawn(tui::run(rx, shutdown.clone(), n_forwards));
+        let result = tmite_core::client::connect::run(params).await;
+        // Wait for the terminal to be restored before reporting errors.
+        let _ = tui_task.await;
+        result.map_err(anyhow::Error::from)
+    } else {
+        println!("Connecting to {name}...");
+        tmite_core::client::connect::run(base)
+            .await
+            .map_err(anyhow::Error::from)
+    }
 }
 
 fn node_id_cmd(cli: &Cli) -> anyhow::Result<()> {

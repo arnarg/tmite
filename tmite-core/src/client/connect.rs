@@ -1,20 +1,22 @@
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
+use std::time::Duration;
 
 use thiserror::Error;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::Notify;
+use tokio::sync::{Notify, mpsc};
+use tokio::time::MissedTickBehavior;
 
+use crate::client::model::{ConnHandle, ConnRegistry, ForwardRow, PathRow, UiEvent};
 use crate::client::session::{Session, SessionError};
 use crate::fsio::{ClientStore, load_or_create_keypair, servers_toml_path};
 use crate::net::{EndpointRole, NetOpts, build_endpoint};
 use crate::stream_io::{read_frame, write_frame};
 use n0_future::StreamExt;
 use tmite_proto::alpn::DATA_ALPN;
-use tmite_proto::frame::{
-    DataDenyReason, DataFrame, SessionForward, TYPE_FORWARD, TYPE_VALIDATE,
-};
+use tmite_proto::frame::{DataDenyReason, DataFrame, SessionForward, TYPE_FORWARD, TYPE_VALIDATE};
 use tmite_proto::limits;
 
 #[derive(Debug, Error)]
@@ -88,6 +90,12 @@ pub struct ConnectParams {
     pub specs: Vec<FwdSpec>,
     pub data_dir: PathBuf,
     pub net_opts: NetOpts,
+    /// TUI event channel (§7.4). When set, structured events are emitted,
+    /// the plain-stdout UI is suppressed, and path/connection collectors
+    /// run. `None` keeps the plain forwarding UI.
+    pub events: Option<mpsc::UnboundedSender<UiEvent>>,
+    /// Cooperative shutdown; the TUI signals `q`/Ctrl-C through it.
+    pub shutdown: Arc<Notify>,
 }
 
 /// User-visible progress goes through tracing; the bin layer configures it.
@@ -118,6 +126,23 @@ pub async fn run(params: ConnectParams) -> Result<(), ConnectError> {
                 name: params.name.clone(),
             })?;
 
+    if let Some(tx) = &params.events {
+        let _ = tx.send(UiEvent::Server {
+            name: entry.name.clone(),
+            node: server_id.to_string(),
+        });
+        let _ = tx.send(UiEvent::Forwards(
+            params
+                .specs
+                .iter()
+                .map(|spec| ForwardRow {
+                    local: SocketAddr::new(spec.local_addr, spec.local_port).to_string(),
+                    target: spec.target.clone(),
+                })
+                .collect(),
+        ));
+    }
+
     let endpoint = build_endpoint(
         secret_key,
         vec![DATA_ALPN.to_vec()],
@@ -127,10 +152,10 @@ pub async fn run(params: ConnectParams) -> Result<(), ConnectError> {
     .await?;
 
     let mut listeners = Vec::new();
-    for spec in &params.specs {
+    for (idx, spec) in params.specs.iter().enumerate() {
         let addr = SocketAddr::new(spec.local_addr, spec.local_port);
         let listener = TcpListener::bind(addr).await?;
-        listeners.push((listener, spec.clone()));
+        listeners.push((listener, idx));
     }
 
     // SESSION hello: announces the bound listeners for the daemon's status
@@ -148,6 +173,10 @@ pub async fn run(params: ConnectParams) -> Result<(), ConnectError> {
     let hello = tmite_proto::frame::encode_frame(hello.msg_type(), &hello)
         .map_err(|e| ConnectError::Session(SessionError::Unreachable(e.to_string())))?;
     let session = Arc::new(Session::new(endpoint.clone(), server_id, hello));
+    let registry = params
+        .events
+        .as_ref()
+        .map(|tx| Arc::new(ConnRegistry::new(tx.clone())));
 
     // Eager connect + per-spec validation: fail fast before entering the
     // accept loop (§7.4).
@@ -156,21 +185,107 @@ pub async fn run(params: ConnectParams) -> Result<(), ConnectError> {
         validate_forward(&conn, spec).await?;
     }
 
-    let ui: Arc<dyn ConnectUi> = Arc::new(ForwardingUi);
-    for (_, spec) in &listeners {
-        ui.listening(spec);
+    let ui: Arc<dyn ConnectUi> = match &params.events {
+        Some(tx) => Arc::new(UiBridge { tx: tx.clone() }),
+        None => Arc::new(ForwardingUi),
+    };
+    for (_, idx) in &listeners {
+        ui.listening(&params.specs[*idx]);
+    }
+    if let Some(tx) = &params.events {
+        let _ = tx.send(UiEvent::Started);
     }
 
-    let shutdown = Arc::new(Notify::new());
-
-    // Print transport path changes until the connection drops; re-arm on
-    // re-dial so a fresh connection is watched too.
-    let watch_session = session.clone();
-    let watch_ui: Arc<dyn ConnectUi> = Arc::new(ForwardingUi);
-    let watch_shutdown = shutdown.clone();
+    let shutdown = params.shutdown.clone();
     let mut tasks_path_watch = Vec::new();
+
+    // Forward session state transitions (dialing/established/re-dials) to
+    // the TUI; re-arms are unnecessary, the watch survives re-dials.
+    if let Some(tx) = params.events.clone() {
+        let watch_session = session.clone();
+        let watch_shutdown = shutdown.clone();
+        tasks_path_watch.push(tokio::spawn(async move {
+            let mut rx = watch_session.status();
+            let initial = rx.borrow_and_update().clone();
+            if tx.send(UiEvent::SessionState(initial)).is_err() {
+                return;
+            }
+            loop {
+                tokio::select! {
+                    _ = watch_shutdown.notified() => return,
+                    changed = rx.changed() => match changed {
+                        Ok(()) => {
+                            let status = rx.borrow_and_update().clone();
+                            if tx.send(UiEvent::SessionState(status)).is_err() {
+                                return;
+                            }
+                        }
+                        Err(_) => return,
+                    },
+                }
+            }
+        }));
+    }
+
+    // Per-connection byte ticks for the TUI.
+    if let Some(registry) = registry.clone() {
+        let tx = params.events.clone().expect("registry implies events");
+        let watch_shutdown = shutdown.clone();
+        tasks_path_watch.push(tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_millis(500));
+            interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    _ = watch_shutdown.notified() => return,
+                    _ = interval.tick() => {
+                        for (id, tx_bytes, rx_bytes) in registry.snapshot() {
+                            if tx
+                                .send(UiEvent::ConnectionBytes { id, tx: tx_bytes, rx: rx_bytes })
+                                .is_err()
+                            {
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+        }));
+    }
+
+    // Watch transport paths until the connection drops; re-arm on re-dial.
+    // TUI mode replaces per-event printing with periodic snapshots taken
+    // from the current connection (covers re-dials automatically).
+    let watch_session = session.clone();
+    let watch_ui: Arc<dyn ConnectUi> = match &params.events {
+        Some(tx) => Arc::new(UiBridge { tx: tx.clone() }),
+        None => Arc::new(ForwardingUi),
+    };
+    let watch_events = params.events.clone();
+    let watch_shutdown = shutdown.clone();
     tasks_path_watch.push(tokio::spawn(async move {
         loop {
+            if let Some(tx) = &watch_events {
+                let mut interval = tokio::time::interval(Duration::from_millis(500));
+                interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+                loop {
+                    tokio::select! {
+                        _ = watch_shutdown.notified() => return,
+                        _ = interval.tick() => {
+                            let conn = match watch_session.get().await {
+                                Ok(conn) => conn,
+                                Err(_) => {
+                                    let _ = tx.send(UiEvent::Paths(Vec::new()));
+                                    continue;
+                                }
+                            };
+                            let rows = snapshot_paths(&conn);
+                            if tx.send(UiEvent::Paths(rows)).is_err() {
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
             let conn = match watch_session.get().await {
                 Ok(conn) => conn,
                 Err(e) => {
@@ -206,22 +321,26 @@ pub async fn run(params: ConnectParams) -> Result<(), ConnectError> {
     }));
 
     let mut tasks = Vec::new();
-    for (listener, spec) in listeners {
+    for (listener, idx) in listeners {
         let session = session.clone();
-        let ui: Arc<dyn ConnectUi> = Arc::new(ForwardingUi);
+        let ui = ui.clone();
+        let registry = registry.clone();
         let shutdown = shutdown.clone();
+        let spec = params.specs[idx].clone();
         tasks.push(tokio::spawn(async move {
             loop {
                 tokio::select! {
                     _ = shutdown.notified() => break,
                     accepted = listener.accept() => {
                         match accepted {
-                            Ok((tcp, _peer)) => {
+                            Ok((tcp, peer)) => {
                                 let session = session.clone();
                                 let spec = spec.clone();
                                 let ui = ui.clone();
+                                let registry = registry.clone();
                                 tokio::spawn(async move {
-                                    handle_local(tcp, session, spec, ui).await;
+                                    handle_local(tcp, peer, session, spec, ui, registry, idx)
+                                        .await;
                                 });
                             }
                             Err(e) => {
@@ -249,6 +368,48 @@ pub async fn run(params: ConnectParams) -> Result<(), ConnectError> {
 
 struct ForwardingUi;
 
+/// ConnectUi that routes display strings into TUI events. `listening` is a
+/// no-op: the forwards pane is seeded from the specs directly.
+struct UiBridge {
+    tx: mpsc::UnboundedSender<UiEvent>,
+}
+
+impl ConnectUi for UiBridge {
+    fn listening(&self, _spec: &FwdSpec) {}
+    fn info(&self, msg: &str) {
+        let _ = self.tx.send(UiEvent::Notice(msg.to_string()));
+    }
+    fn warn(&self, msg: &str) {
+        let _ = self.tx.send(UiEvent::Notice(msg.to_string()));
+    }
+    fn denied(&self, target: &str, reason: &DataDenyReason) {
+        let _ = self.tx.send(UiEvent::Notice(format!(
+            "forward to {target} denied: {reason:?}"
+        )));
+    }
+    fn path(&self, msg: &str) {
+        let _ = self.tx.send(UiEvent::Notice(msg.to_string()));
+    }
+}
+
+/// Owned view of the connection's open paths for the TUI snapshot tick.
+fn snapshot_paths(conn: &iroh::endpoint::Connection) -> Vec<PathRow> {
+    conn.paths()
+        .into_iter()
+        .map(|p| {
+            let rtt = p.rtt();
+            PathRow {
+                remote_addr: p.remote_addr().to_string(),
+                relay: p.is_relay(),
+                selected: p.is_selected(),
+                rtt: if rtt.is_zero() { None } else { Some(rtt) },
+                tx_bytes: p.stats().udp_tx.bytes,
+                rx_bytes: p.stats().udp_rx.bytes,
+            }
+        })
+        .collect()
+}
+
 impl ConnectUi for ForwardingUi {
     fn listening(&self, spec: &FwdSpec) {
         println!(
@@ -272,7 +433,10 @@ impl ConnectUi for ForwardingUi {
 
 /// Startup fail-fast probe: asks the server whether `spec.target` would be
 /// allowed, without dialing it (VALIDATE frame, §7.2).
-async fn validate_forward(conn: &iroh::endpoint::Connection, spec: &FwdSpec) -> Result<(), ConnectError> {
+async fn validate_forward(
+    conn: &iroh::endpoint::Connection,
+    spec: &FwdSpec,
+) -> Result<(), ConnectError> {
     let (mut send, mut recv) = conn
         .open_bi()
         .await
@@ -306,13 +470,46 @@ async fn validate_forward(conn: &iroh::endpoint::Connection, spec: &FwdSpec) -> 
 }
 
 /// Per accepted TCP conn: ensure session, open stream, FORWARD, await
-/// OK/DENY, relay (§7.4).
+/// OK/DENY, relay (§7.4). When a registry is present, the connection is
+/// tracked and announced to the TUI; byte counters feed the periodic tick.
 async fn handle_local(
     tcp: TcpStream,
+    peer: SocketAddr,
     session: Arc<Session>,
     spec: FwdSpec,
     ui: Arc<dyn ConnectUi>,
+    registry: Option<Arc<ConnRegistry>>,
+    spec_idx: usize,
 ) {
+    // Announce + auto-close: a guard so every early return (denied, dial
+    // failure) still removes the connection from the TUI's totals.
+    let conn_handle = registry
+        .as_ref()
+        .map(|reg| reg.create(spec_idx, peer.to_string()));
+    struct ConnGuard {
+        registry: Option<(Arc<ConnRegistry>, Arc<ConnHandle>)>,
+    }
+    impl Drop for ConnGuard {
+        fn drop(&mut self) {
+            if let Some((reg, handle)) = &self.registry {
+                reg.close(handle);
+            }
+        }
+    }
+    let _guard = ConnGuard {
+        registry: conn_handle
+            .clone()
+            .zip(registry.clone())
+            .map(|(handle, reg)| (reg, handle)),
+    };
+
+    let plain_tx = AtomicU64::new(0);
+    let plain_rx = AtomicU64::new(0);
+    let (tx_counter, rx_counter): (&AtomicU64, &AtomicU64) = match &conn_handle {
+        Some(handle) => (handle.tx(), handle.rx()),
+        None => (&plain_tx, &plain_rx),
+    };
+
     // Per-stream errors never touch session state; connection-level errors
     // reset it and we re-dial once here.
     for attempt in 0..2 {
@@ -383,11 +580,24 @@ async fn handle_local(
             }
         }
 
+        if let (Some(reg), Some(handle)) = (&registry, &conn_handle) {
+            reg.admit(handle);
+        }
+
         let (mut tcp_read, mut tcp_write) = tcp.into_split();
-        let up = crate::daemon::main_ep::pump(&mut recv, &mut tcp_write, std::time::Duration::ZERO);
+        let up = crate::daemon::main_ep::pump_counted(
+            &mut recv,
+            &mut tcp_write,
+            std::time::Duration::ZERO,
+            rx_counter,
+        );
         tokio::pin!(up);
-        let down =
-            crate::daemon::main_ep::pump(&mut tcp_read, &mut send, std::time::Duration::ZERO);
+        let down = crate::daemon::main_ep::pump_counted(
+            &mut tcp_read,
+            &mut send,
+            std::time::Duration::ZERO,
+            tx_counter,
+        );
         tokio::pin!(down);
         let _ = tokio::join!(up, down);
         return;
