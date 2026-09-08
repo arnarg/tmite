@@ -115,6 +115,22 @@
 
       checks = forAllSystems (system: pkgs: checksFor pkgs);
 
+      # nix/modules/nixos.nix stays a plain module (default `pkgs.tmite`);
+      # this wrapper defaults the package to the flake build, so importing
+      # the module and enabling is enough.
+      nixosModules.default =
+        {
+          lib,
+          pkgs,
+          ...
+        }:
+        {
+          imports = [ ./nix/modules/nixos.nix ];
+          services.tmite.package = lib.mkDefault (
+            self.packages.${pkgs.stdenv.hostPlatform.system}.tmite
+          );
+        };
+
       devShells = forAllSystems (
         system: pkgs: {
           default = pkgs.mkShell {

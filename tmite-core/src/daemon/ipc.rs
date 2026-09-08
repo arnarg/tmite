@@ -41,7 +41,7 @@ pub async fn serve(socket_path: PathBuf, handle: Arc<DaemonHandle>) -> Result<()
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o600));
+        let _ = std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o660));
     }
 
     tracing::info!(path = %socket_path.display(), "IPC server listening");

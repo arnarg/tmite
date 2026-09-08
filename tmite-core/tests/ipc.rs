@@ -44,6 +44,12 @@ async fn start_daemon_ipc(dir: &tempfile::TempDir) -> (std::path::PathBuf, Arc<S
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     assert!(path.exists(), "socket not created");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o660, "IPC socket must be group-usable");
+    }
     (path, state)
 }
 

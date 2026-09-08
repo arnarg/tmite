@@ -16,6 +16,8 @@ pub enum FsError {
     TomlSer(#[from] toml::ser::Error),
     #[error("invalid keypair file: expected 64 hex chars")]
     BadKeypair,
+    #[error("cannot determine user data directory (XDG_DATA_HOME and HOME are unset)")]
+    NoHome,
     #[error("name {0:?} is already paired to a different server")]
     NameInUse(String),
 }
@@ -29,16 +31,43 @@ pub fn hex(data: &[u8]) -> String {
     s
 }
 
-pub fn default_client_data_dir() -> PathBuf {
-    if let Some(dir) = std::env::var_os("XDG_DATA_HOME")
-        && !dir.is_empty()
-    {
-        return PathBuf::from(dir).join("tmite");
+pub fn default_client_data_dir() -> Result<PathBuf, FsError> {
+    dirs::data_dir()
+        .map(|dir| dir.join("tmite"))
+        .ok_or(FsError::NoHome)
+}
+
+/// Base directory for runtime files (the IPC socket): the user's session
+/// runtime directory when available, otherwise the shared system one.
+pub fn runtime_base() -> Option<PathBuf> {
+    dirs::runtime_dir().map(|dir| dir.join("tmite"))
+}
+
+pub fn default_socket_path() -> PathBuf {
+    runtime_base()
+        .unwrap_or_else(|| PathBuf::from("/run/tmite"))
+        .join("daemon.sock")
+}
+
+/// Socket paths an IPC client should try in order. An explicit path disables
+/// fallback so misconfiguration is never masked.
+pub fn candidate_socket_paths(explicit: Option<&Path>) -> Vec<PathBuf> {
+    candidate_socket_paths_with(explicit, runtime_base().as_deref())
+}
+
+pub fn candidate_socket_paths_with(
+    explicit: Option<&Path>,
+    runtime: Option<&Path>,
+) -> Vec<PathBuf> {
+    if let Some(path) = explicit {
+        return vec![path.to_path_buf()];
     }
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."));
-    home.join(".local/share/tmite")
+    let mut paths = Vec::new();
+    if let Some(runtime) = runtime {
+        paths.push(runtime.join("daemon.sock"));
+    }
+    paths.push(Path::new("/run/tmite").join("daemon.sock"));
+    paths
 }
 
 /// Loads the hex-encoded 32-byte secret key at `path`, generating and writing

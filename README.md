@@ -57,8 +57,9 @@ cargo run -- node-id      --data-dir ./data
 
 Production: install the binary plus `packaging/tmite.service`; state lives in
 `/var/lib/tmite` (`StateDirectory=tmite`), the admin IPC socket in
-`/run/tmite/daemon.sock` (`RuntimeDirectory=tmite`, mode 0600). Multi-admin
-access is a dedicated group plus `0660` on the socket.
+`/run/tmite/daemon.sock` (`RuntimeDirectory=tmite`, mode 0660). Users in the
+daemon's group can run the admin CLI; for a non-root daemon the socket lives
+in `$XDG_RUNTIME_DIR/tmite/` instead.
 
 ## Pairing model
 

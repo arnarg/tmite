@@ -7,7 +7,9 @@ use clap::{Parser, Subcommand};
 use tmite_core::client::connect::{ConnectParams, parse_fwd_spec};
 use tmite_core::client::pair::{PairParams, PairUi};
 use tmite_core::daemon::{DaemonConfig, run as daemon_run};
-use tmite_core::fsio::{default_client_data_dir, load_or_create_keypair};
+use tmite_core::fsio::{
+    candidate_socket_paths, default_client_data_dir, default_socket_path, load_or_create_keypair,
+};
 use tmite_core::net::{NetOpts, grouped_hex};
 
 static EXIT_CODE: AtomicI32 = AtomicI32::new(0);
@@ -123,10 +125,7 @@ async fn main() {
                 .data_dir
                 .clone()
                 .unwrap_or_else(|| PathBuf::from("/var/lib/tmite"));
-            let socket_path = cli
-                .socket_path
-                .clone()
-                .unwrap_or_else(|| PathBuf::from("/run/tmite/daemon.sock"));
+            let socket_path = cli.socket_path.clone().unwrap_or_else(default_socket_path);
             daemon_run(DaemonConfig {
                 data_dir,
                 socket_path,
@@ -141,11 +140,7 @@ async fn main() {
         }
         Command::Peer { cmd } => peer_cmd(cli.clone(), cmd.clone()).await,
         Command::Status => status_cmd(&cli).await,
-        Command::Pair {
-            code,
-            name,
-            ..
-        } => pair_cmd(&cli, code.clone(), name.clone()).await,
+        Command::Pair { code, name, .. } => pair_cmd(&cli, code.clone(), name.clone()).await,
         Command::Connect { name, fwd } => connect_cmd(&cli, name.clone(), fwd.clone()).await,
         Command::NodeId => node_id_cmd(&cli),
     };
@@ -172,14 +167,15 @@ fn init_tracing(verbose: u8) {
         .try_init();
 }
 
-fn client_data_dir(cli: &Cli) -> PathBuf {
-    cli.data_dir.clone().unwrap_or_else(default_client_data_dir)
+fn client_data_dir(cli: &Cli) -> anyhow::Result<PathBuf> {
+    match &cli.data_dir {
+        Some(dir) => Ok(dir.clone()),
+        None => Ok(default_client_data_dir()?),
+    }
 }
 
-fn daemon_socket(cli: &Cli) -> PathBuf {
-    cli.socket_path
-        .clone()
-        .unwrap_or_else(|| PathBuf::from("/run/tmite/daemon.sock"))
+fn daemon_socket_candidates(cli: &Cli) -> Vec<PathBuf> {
+    candidate_socket_paths(cli.socket_path.as_deref())
 }
 
 // ---------------------------------------------------------------------------
@@ -191,15 +187,40 @@ struct IpcConn {
     write: tokio::net::unix::OwnedWriteHalf,
 }
 
-async fn ipc_connect(path: &PathBuf) -> anyhow::Result<IpcConn> {
-    let stream = tokio::net::UnixStream::connect(path)
-        .await
-        .with_context(|| format!("cannot connect to daemon socket {}", path.display()))?;
-    let (read, write) = stream.into_split();
-    Ok(IpcConn {
-        reader: tokio::io::BufReader::new(read),
-        write,
-    })
+async fn ipc_connect(paths: &[PathBuf]) -> anyhow::Result<IpcConn> {
+    let mut last_err = None;
+    for path in paths {
+        match tokio::net::UnixStream::connect(path).await {
+            Ok(stream) => {
+                let (read, write) = stream.into_split();
+                return Ok(IpcConn {
+                    reader: tokio::io::BufReader::new(read),
+                    write,
+                });
+            }
+            Err(e) => {
+                // A missing socket means this candidate simply isn't the one;
+                // anything else is worth reporting if no candidate works.
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    last_err = Some((path.clone(), anyhow::Error::new(e)));
+                }
+            }
+        }
+    }
+    match last_err {
+        Some((path, err)) => Err(err.context(format!(
+            "cannot connect to daemon socket {}",
+            path.display()
+        ))),
+        None => bail!(
+            "daemon socket not found; tried: {}",
+            paths
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
 }
 
 impl IpcConn {
@@ -227,11 +248,11 @@ fn ipc_request(id: u64, method: &str, params: serde_json::Value) -> String {
 }
 
 async fn ipc_call(
-    path: &PathBuf,
+    paths: &[PathBuf],
     method: &str,
     params: serde_json::Value,
 ) -> anyhow::Result<serde_json::Value> {
-    let mut conn = ipc_connect(path).await?;
+    let mut conn = ipc_connect(paths).await?;
     conn.send(&ipc_request(1, method, params)).await?;
     loop {
         let Some(reply) = conn.reply().await? else {
@@ -254,12 +275,12 @@ async fn ipc_call(
 // ---------------------------------------------------------------------------
 
 async fn peer_cmd(cli: Cli, cmd: PeerCmd) -> anyhow::Result<()> {
-    let socket = daemon_socket(&cli);
+    let sockets = daemon_socket_candidates(&cli);
     match cmd {
-        PeerCmd::Invite { name, ttl, yes } => invite_cmd(&socket, name, ttl, yes).await,
+        PeerCmd::Invite { name, ttl, yes } => invite_cmd(&sockets, name, ttl, yes).await,
         PeerCmd::Allow { peer, target } => {
             let result = ipc_call(
-                &socket,
+                &sockets,
                 "peer.allow",
                 serde_json::json!({ "peer": peer, "target": target }),
             )
@@ -269,7 +290,7 @@ async fn peer_cmd(cli: Cli, cmd: PeerCmd) -> anyhow::Result<()> {
         }
         PeerCmd::Revoke { peer, target } => {
             let result = ipc_call(
-                &socket,
+                &sockets,
                 "peer.revoke",
                 serde_json::json!({ "peer": peer, "target": target }),
             )
@@ -286,13 +307,13 @@ async fn peer_cmd(cli: Cli, cmd: PeerCmd) -> anyhow::Result<()> {
             Ok(())
         }
         PeerCmd::Ls => {
-            let result = ipc_call(&socket, "peer.ls", serde_json::json!({})).await?;
+            let result = ipc_call(&sockets, "peer.ls", serde_json::json!({})).await?;
             println!("{result:#}");
             Ok(())
         }
         PeerCmd::Rm { peer, force } => {
             let result = ipc_call(
-                &socket,
+                &sockets,
                 "peer.rm",
                 serde_json::json!({ "peer": peer, "force": force }),
             )
@@ -312,12 +333,12 @@ async fn peer_cmd(cli: Cli, cmd: PeerCmd) -> anyhow::Result<()> {
 }
 
 async fn invite_cmd(
-    socket: &PathBuf,
+    sockets: &[PathBuf],
     name: String,
     ttl: Option<u64>,
     yes: bool,
 ) -> anyhow::Result<()> {
-    let mut conn = ipc_connect(socket).await?;
+    let mut conn = ipc_connect(sockets).await?;
     conn.send(&ipc_request(
         1,
         "peer.invite",
@@ -429,7 +450,12 @@ fn grouped_node_id(node_id: &str) -> String {
 }
 
 async fn status_cmd(cli: &Cli) -> anyhow::Result<()> {
-    let result = ipc_call(&daemon_socket(cli), "daemon.status", serde_json::json!({})).await?;
+    let result = ipc_call(
+        &daemon_socket_candidates(cli),
+        "daemon.status",
+        serde_json::json!({}),
+    )
+    .await?;
     println!("{result:#}");
     Ok(())
 }
@@ -451,9 +477,7 @@ impl PairUi for PairPromptUi {
 }
 
 async fn pair_cmd(cli: &Cli, code: Option<String>, name: Option<String>) -> anyhow::Result<()> {
-    let name = name
-        .map(|n| n.trim().to_string())
-        .filter(|n| !n.is_empty());
+    let name = name.map(|n| n.trim().to_string()).filter(|n| !n.is_empty());
     let mut code_opt = code;
     let mut attempts = 0;
     loop {
@@ -485,7 +509,7 @@ async fn pair_cmd(cli: &Cli, code: Option<String>, name: Option<String>) -> anyh
 
     let params = PairParams {
         code,
-        data_dir: client_data_dir(cli),
+        data_dir: client_data_dir(cli)?,
         client_version: tmite_core::CRATE_VERSION.to_string(),
         net_opts: NetOpts::default(),
         name,
@@ -519,7 +543,7 @@ async fn connect_cmd(cli: &Cli, name: String, fwd: Vec<String>) -> anyhow::Resul
     let params = ConnectParams {
         name,
         specs,
-        data_dir: client_data_dir(cli),
+        data_dir: client_data_dir(cli)?,
         net_opts: NetOpts::default(),
     };
     println!("Connecting... (first connection through a cold tunnel may take a few seconds)");
@@ -529,7 +553,7 @@ async fn connect_cmd(cli: &Cli, name: String, fwd: Vec<String>) -> anyhow::Resul
 }
 
 fn node_id_cmd(cli: &Cli) -> anyhow::Result<()> {
-    let data_dir = cli.data_dir.clone().unwrap_or_else(default_client_data_dir);
+    let data_dir = client_data_dir(cli)?;
     let keypair = load_or_create_keypair(&data_dir.join("keypair"))?;
     let id = keypair.public();
     println!("{}", grouped_hex(&id.as_bytes()[..]));

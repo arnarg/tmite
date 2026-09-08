@@ -1,0 +1,5 @@
+# Add my MCP server for looking up packages on crates.io
+mcp add cratesio \
+	--type http \
+	--url https://crates.cdbrdr.com/ \
+	--timeout 20

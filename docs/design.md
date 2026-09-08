@@ -93,10 +93,10 @@ ssh -p 2222 localhost
 
 | | Server | Client |
 |---|---|---|
-| Keypair + state | `/var/lib/tmite/` (or `--data-dir`) | `~/.local/share/tmite/` (XDG; `--data-dir` overrides) |
-| IPC socket | `/run/tmite/daemon.sock` (or `--socket-path`) | n/a |
+| Keypair + state | `/var/lib/tmite/` (or `--data-dir`) | `$XDG_DATA_HOME/tmite/` (i.e. `~/.local/share/tmite/`; `--data-dir` overrides) |
+| IPC socket | `$XDG_RUNTIME_DIR/tmite/daemon.sock`, else `/run/tmite/daemon.sock` (or `--socket-path`) | tries `$XDG_RUNTIME_DIR/tmite/daemon.sock` then `/run/tmite/daemon.sock` (or just `--socket-path`) |
 
-Paths follow XDG on the client; the server paths are overridable by flags for development (run everything under `./data/` and `./run/`).
+Paths follow XDG via the `dirs` crate on the client; the server paths are overridable by flags for development (run everything under `./data/` and `./run/`). A client `--socket-path` disables candidate fallback so misconfiguration is never masked.
 
 ### 3.2 Files
 
@@ -355,7 +355,7 @@ tmite status                          # uptime, node id, version, peer/rule/invi
 
 ## 9. IPC protocol
 
-Unix socket (`/run/tmite/daemon.sock`, mode `0600`, parent dir `0755`; document that a dedicated group + `0660` is the supported multi-admin setup). NDJSON: one JSON object per line, both directions. Access control is entirely the socket's.
+Unix socket (`$XDG_RUNTIME_DIR/tmite/daemon.sock`, falling back to `/run/tmite/daemon.sock` under systemd, or `--socket-path`), mode `0660`, parent dir `0755`; users in the daemon's group can use the admin CLI over it. NDJSON: one JSON object per line, both directions. Access control is entirely the socket's.
 
 ### 9.1 Envelope
 
@@ -446,9 +446,13 @@ Wants=network-online.target
 [Service]
 ExecStart=/usr/local/bin/tmite daemon
 Restart=on-failure
+User=tmite
+Group=tmite
 StateDirectory=tmite
 RuntimeDirectory=tmite
 # StateDirectory ⇒ /var/lib/tmite, RuntimeDirectory ⇒ /run/tmite
+# (systemd chowns both to User=/Group=tmite; socket mode 0660 lets
+# `tmite`-group members run the admin CLI)
 ```
 
 ---
