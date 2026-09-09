@@ -212,11 +212,12 @@ laptop (tmite pair)                       daemon (invite endpoint)
 | 0x04 | `PAIR_CONFIRM` | `{ node_id: [u8;32], name: String }` | server → client |
 | 0x05 | `PAIR_DENY` | `{ reason: Reason }` | server → client |
 
-`Reason` enum: `NameTaken`, `AdminDenied`, `Expired`, `ServerError`. Payloads are JSON (UTF-8) inside the length-prefixed frame; JSON is used for all control payloads in both ALPNs (§7.1).
+`Reason` enum: `NameTaken`, `AdminDenied`, `Expired`, `ServerError`, `Busy`. Payloads are JSON (UTF-8) inside the length-prefixed frame; JSON is used for all control payloads in both ALPNs (§7.1).
 
 ### 5.3 Confirmation and timeouts
 
 - **Prompt timeout:** if the client connects but no `peer.invite.decide` arrives within **120 s**, the daemon sends `PAIR_DENY { reason: Expired }`. The invite itself stays alive until TTL; a client may reconnect and try again while the admin is still deciding. The token is burned only by explicit admin rejection or TTL expiry.
+- **Single pair connection:** only one pair connection may be in progress per invite. The daemon claims a slot when a connection passes the accept loop and releases it when that connection ends without a recorded peer (including a client that vanishes mid-wait). While the slot is held, any further connection gets `PAIR_DENY { reason: Busy }` immediately — a racing code-holder is never confirmed for an unregistered NodeId.
 - **Escalating reject delay** (§6.5) applies per invite endpoint.
 - Client behavior on `PAIR_DENY`: print reason, exit 3 (`AdminDenied`) or 2 (other).
 - On `PAIR_CONFIRM`, the client prints the server's NodeId in the same grouped-hex format and persists `servers.toml` (under the `--name` alias if given), then exits 0.

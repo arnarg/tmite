@@ -89,6 +89,9 @@ pub enum PairDenyReason {
     AdminDenied,
     Expired,
     ServerError,
+    /// Another pair connection is already active on this invite; only one
+    /// pair connection may be in progress at a time (§5).
+    Busy,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

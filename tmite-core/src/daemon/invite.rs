@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use iroh::endpoint::{Connection, VarInt};
-use iroh::{PublicKey, SecretKey};
+use iroh::{Endpoint, PublicKey, SecretKey};
 use serde_json::json;
 use tokio::sync::{Mutex, Notify, mpsc, oneshot};
 use zeroize::Zeroizing;
@@ -84,6 +84,11 @@ pub struct InviteShared {
     request_id: u64,
     delay: Mutex<RejectDelay>,
     peer_recorded: Mutex<bool>,
+    /// Single pair-connection slot: only one pair connection may be in
+    /// progress per invite (§5). Claimed by the accept loop before spawning
+    /// the handler task; a second concurrent connection gets `PAIR_DENY
+    /// { Busy }`.
+    pair_busy: Mutex<bool>,
     /// The daemon's main-endpoint identity, delivered to the client in
     /// `PAIR_CONFIRM` so it can pin and dial the right node (§5, §10.3).
     server_node_id: PublicKey,
@@ -98,6 +103,20 @@ impl InviteShared {
 
     async fn decision(&self) -> Option<bool> {
         *self.decision.lock().await
+    }
+
+    async fn claim_pair_slot(&self) -> bool {
+        let mut busy = self.pair_busy.lock().await;
+        if *busy {
+            false
+        } else {
+            *busy = true;
+            true
+        }
+    }
+
+    async fn release_pair_slot(&self) {
+        *self.pair_busy.lock().await = false;
     }
 
     fn emit(&self, event: &str, data: serde_json::Value) {
@@ -196,6 +215,7 @@ impl InviteManager {
             request_id,
             delay: Mutex::new(RejectDelay::new()),
             peer_recorded: Mutex::new(false),
+            pair_busy: Mutex::new(false),
             server_node_id: self.server_node_id,
             entries: self.entries.clone(),
         });
@@ -256,7 +276,7 @@ async fn run_invite_endpoint(
     name: String,
     code: String,
     opts: NetOpts,
-    mut outcome_rx: mpsc::UnboundedReceiver<Outcome>,
+    outcome_rx: mpsc::UnboundedReceiver<Outcome>,
 ) {
     let endpoint = match build_endpoint(
         secret_key,
@@ -294,6 +314,17 @@ async fn run_invite_endpoint(
         ttl_secs = ttl_secs
     );
 
+    invite_serve(endpoint, shared, outcome_rx).await;
+}
+
+/// Runs the accept/decision loop on an already-built invite endpoint.
+/// Split out of `run_invite_endpoint` so tests can drive it on an offline
+/// loopback endpoint.
+async fn invite_serve(
+    endpoint: Endpoint,
+    shared: Arc<InviteShared>,
+    mut outcome_rx: mpsc::UnboundedReceiver<Outcome>,
+) {
     let mut outcome: Option<Outcome> = None;
     loop {
         tokio::select! {
@@ -333,8 +364,12 @@ async fn run_invite_endpoint(
                         match connecting.await {
                             Ok(conn) => {
                                 { shared.delay.lock().await.reset(); }
-                                let s = shared.clone();
-                                tokio::spawn(handle_pair_conn(conn, s));
+                                if shared.claim_pair_slot().await {
+                                    let s = shared.clone();
+                                    tokio::spawn(handle_pair_conn(conn, s));
+                                } else {
+                                    tokio::spawn(refuse_pair_busy(conn));
+                                }
                             }
                             Err(e) => {
                                 tracing::debug!("invite connection failed: {e}");
@@ -351,7 +386,6 @@ async fn run_invite_endpoint(
         }
     }
 
-    let _ = invite_node_id;
     if matches!(outcome, Some(Outcome::Rejected) | Some(Outcome::Expired)) {
         // Give in-flight connection tasks a moment to flush their PAIR_DENY.
         shared.notify.notify_waiters();
@@ -389,7 +423,31 @@ async fn wait_for_verdict_ack(recv: &mut RecvStream) {
 }
 
 /// Handles one pairing connection on the invite endpoint (§5).
+///
+/// The single pair slot is claimed by the accept loop before this task is
+/// spawned; it is released here when the connection ends without a recorded
+/// peer, so a client that vanished or failed its handshake cannot block a
+/// legitimate retry.
 async fn handle_pair_conn(conn: Connection, shared: Arc<InviteShared>) {
+    handle_pair_conn_inner(conn, &shared).await;
+    shared.release_pair_slot().await;
+}
+
+/// Refuses a pair connection that arrived while another one is active: only
+/// one pair connection may be in progress per invite (§5).
+async fn refuse_pair_busy(conn: Connection) {
+    if let Ok((mut send, mut recv)) = conn.accept_bi().await {
+        let frame = PairingFrame::PairDeny {
+            reason: PairDenyReason::Busy,
+        };
+        let _ = write_frame(&mut send, frame.msg_type(), &frame).await;
+        let _ = send.finish();
+        wait_for_verdict_ack(&mut recv).await;
+    }
+    conn.close(VarInt::from_u32(1), b"another pairing in progress");
+}
+
+async fn handle_pair_conn_inner(conn: Connection, shared: &InviteShared) {
     let remote = conn.remote_id();
 
     let (mut send, mut recv) = match conn.accept_bi().await {
@@ -451,7 +509,12 @@ async fn handle_pair_conn(conn: Connection, shared: Arc<InviteShared>) {
         }),
     );
 
-    // A client is waiting; apply decision or timeouts (§5.3, §6.5).
+    // A client is waiting; apply decision or timeouts (§5.3, §6.5). The
+    // recv read detects a client that disconnects while waiting so it cannot
+    // hold the pair slot (and the admin's prompt) for the full prompt
+    // timeout: after PAIR_HELLO the client must stay silent, so any read
+    // result means it is gone or misbehaving.
+    let mut scratch = [0u8; 64];
     let deny = loop {
         tokio::select! {
             _ = shared.notify.notified() => {
@@ -459,6 +522,15 @@ async fn handle_pair_conn(conn: Connection, shared: Arc<InviteShared>) {
                     Some(true) => break None,
                     Some(false) => break Some(PairDenyReason::AdminDenied),
                     None => continue,
+                }
+            }
+            read = recv.read(&mut scratch) => {
+                match read {
+                    Ok(None) | Err(_) => return,
+                    Ok(Some(_)) => {
+                        conn.close(VarInt::from_u32(1), b"handshake failed");
+                        return;
+                    }
                 }
             }
             _ = tokio::time::sleep(limits::PROMPT_TIMEOUT) => break Some(PairDenyReason::Expired),
@@ -519,14 +591,221 @@ async fn handle_pair_conn(conn: Connection, shared: Arc<InviteShared>) {
                 }
             } else {
                 drop(recorded);
-                let frame = PairingFrame::PairConfirm {
-                    node_id: *shared.server_node_id.as_bytes(),
-                    name: shared.name.clone(),
+                // Unreachable while only one pair connection runs at a
+                // time, but a racing connection can still land here after
+                // the slot was released by a recorded peer; deny explicitly
+                // rather than confirming an unregistered node id.
+                let frame = PairingFrame::PairDeny {
+                    reason: PairDenyReason::Busy,
                 };
                 let _ = write_frame(&mut send, frame.msg_type(), &frame).await;
                 let _ = send.finish();
                 wait_for_verdict_ack(&mut recv).await;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use iroh::EndpointAddr;
+    use iroh::endpoint::SendStream;
+    use iroh::endpoint::presets;
+    use std::net::SocketAddr;
+    use tmite_proto::frame::TYPE_PAIR_WAIT;
+
+    fn test_shared(
+        dir: &tempfile::TempDir,
+        server_node_id: PublicKey,
+    ) -> (
+        Arc<InviteShared>,
+        mpsc::UnboundedSender<InviteCmd>,
+        oneshot::Receiver<InviteResult>,
+        mpsc::UnboundedReceiver<Outcome>,
+    ) {
+        let state = State::load(&dir.path().join("state.toml")).unwrap();
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        let (result_tx, result_rx) = oneshot::channel();
+        let (outcome_tx, outcome_rx) = mpsc::unbounded_channel();
+        let (event_tx, _event_rx) = mpsc::unbounded_channel();
+        let shared = Arc::new(InviteShared {
+            invite_id: "test".into(),
+            name: "laptop".into(),
+            deadline: tokio::time::Instant::now() + Duration::from_secs(60),
+            state: Arc::new(state),
+            decision: Mutex::new(None),
+            notify: Notify::new(),
+            cmd_rx: Mutex::new(cmd_rx),
+            result_tx: Mutex::new(Some(result_tx)),
+            outcome_tx,
+            event_tx,
+            request_id: 1,
+            delay: Mutex::new(RejectDelay::new()),
+            peer_recorded: Mutex::new(false),
+            pair_busy: Mutex::new(false),
+            server_node_id,
+            entries: Arc::new(Mutex::new(std::collections::HashMap::new())),
+        });
+        (shared, cmd_tx, result_rx, outcome_rx)
+    }
+
+    async fn test_endpoint(sk: &SecretKey) -> Endpoint {
+        Endpoint::builder(presets::Minimal)
+            .secret_key(sk.clone())
+            .alpns(vec![PAIRING_ALPN.to_vec()])
+            .bind_addr("127.0.0.1:0")
+            .unwrap()
+            .bind()
+            .await
+            .unwrap()
+    }
+
+    async fn loopback_addr(ep: &Endpoint) -> SocketAddr {
+        loop {
+            if let Some(a) = ep.addr().ip_addrs().find(|s| s.ip().is_loopback()) {
+                return *a;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    async fn connect_and_hello(
+        client_ep: &Endpoint,
+        invite_ep: &Endpoint,
+        invite_addr: SocketAddr,
+    ) -> (Connection, SendStream, RecvStream) {
+        let addr = EndpointAddr::new(invite_ep.id()).with_ip_addr(invite_addr);
+        let conn = client_ep.connect(addr, PAIRING_ALPN).await.unwrap();
+        let (mut send, recv) = conn.open_bi().await.unwrap();
+        write_frame(
+            &mut send,
+            TYPE_VERSION,
+            &PairingFrame::Version {
+                version: limits::CODE_VERSION,
+            },
+        )
+        .await
+        .unwrap();
+        let hello = PairingFrame::PairHello {
+            client_version: "test".into(),
+        };
+        write_frame(&mut send, hello.msg_type(), &hello)
+            .await
+            .unwrap();
+        (conn, send, recv)
+    }
+
+    async fn read_verdict(recv: &mut RecvStream) -> PairingFrame {
+        let (_, frame) =
+            crate::stream_io::read_frame::<PairingFrame>(recv, Duration::from_secs(10))
+                .await
+                .unwrap();
+        frame
+    }
+
+    async fn expect_pair_wait(recv: &mut RecvStream) {
+        let frame = expect_frame::<PairingFrame>(recv, TYPE_PAIR_WAIT, Duration::from_secs(10))
+            .await
+            .unwrap();
+        assert!(matches!(frame, PairingFrame::PairWait { .. }));
+    }
+
+    /// Regression for the concurrent-pair bug: a second pair connection
+    /// arriving while one is active must get `PAIR_DENY { Busy }`, never a
+    /// `PAIR_CONFIRM` for an unregistered node id.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn second_concurrent_pair_connection_gets_busy_deny() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let server_node_id = SecretKey::from_bytes(&[7u8; 32]).public();
+        let (shared, cmd_tx, result_rx, outcome_rx) = test_shared(&dir, server_node_id);
+
+        let invite_ep = test_endpoint(&SecretKey::from_bytes(&[1u8; 32])).await;
+        let invite_addr = loopback_addr(&invite_ep).await;
+        tokio::spawn(invite_serve(invite_ep.clone(), shared.clone(), outcome_rx));
+
+        let client_a = test_endpoint(&SecretKey::from_bytes(&[2u8; 32])).await;
+        let (conn_a, mut send_a, mut recv_a) =
+            connect_and_hello(&client_a, &invite_ep, invite_addr).await;
+        expect_pair_wait(&mut recv_a).await;
+
+        let client_b = test_endpoint(&SecretKey::from_bytes(&[3u8; 32])).await;
+        let (conn_b, mut send_b, mut recv_b) =
+            connect_and_hello(&client_b, &invite_ep, invite_addr).await;
+        let verdict_b = read_verdict(&mut recv_b).await;
+        assert_eq!(
+            verdict_b,
+            PairingFrame::PairDeny {
+                reason: PairDenyReason::Busy
+            }
+        );
+        let _ = send_b.finish();
+        drop(conn_b);
+        drop(client_b);
+
+        cmd_tx.send(InviteCmd::Decide(true)).unwrap();
+        let verdict_a = read_verdict(&mut recv_a).await;
+        match verdict_a {
+            PairingFrame::PairConfirm { node_id, name } => {
+                assert_eq!(node_id, *server_node_id.as_bytes());
+                assert_eq!(name, "laptop");
+            }
+            other => panic!("expected PAIR_CONFIRM, got {other:?}"),
+        }
+        let _ = send_a.finish();
+
+        let client_a_id = client_a.id().to_string();
+        match tokio::time::timeout(Duration::from_secs(10), result_rx).await {
+            Ok(Ok(InviteResult::Paired { node_id })) => {
+                assert_eq!(node_id, client_a_id);
+            }
+            other => panic!("expected paired result, got {other:?}"),
+        }
+        assert!(
+            !shared.state.is_name_free("laptop"),
+            "peer must be recorded"
+        );
+        drop(conn_a);
+        drop(client_a);
+    }
+
+    /// The pair slot must be released when a waiting client vanishes, so a
+    /// legitimate retry gets a fresh PAIR_WAIT (design §5: reconnects are
+    /// allowed while the admin is still deciding).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pair_slot_released_when_client_vanishes() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let server_node_id = SecretKey::from_bytes(&[7u8; 32]).public();
+        let (shared, _cmd_tx, _result_rx, outcome_rx) = test_shared(&dir, server_node_id);
+
+        let invite_ep = test_endpoint(&SecretKey::from_bytes(&[1u8; 32])).await;
+        let invite_addr = loopback_addr(&invite_ep).await;
+        tokio::spawn(invite_serve(invite_ep.clone(), shared.clone(), outcome_rx));
+
+        let client_a = test_endpoint(&SecretKey::from_bytes(&[2u8; 32])).await;
+        let (conn_a, _send_a, mut recv_a) =
+            connect_and_hello(&client_a, &invite_ep, invite_addr).await;
+        expect_pair_wait(&mut recv_a).await;
+        conn_a.close(VarInt::from_u32(0), b"gone");
+
+        // Wait for the handler to notice the vanished client and release
+        // the slot before the retry connects.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if !*shared.pair_busy.lock().await {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        let client_c = test_endpoint(&SecretKey::from_bytes(&[4u8; 32])).await;
+        let (conn_c, _send_c, mut recv_c) =
+            connect_and_hello(&client_c, &invite_ep, invite_addr).await;
+        expect_pair_wait(&mut recv_c).await;
+        drop(conn_c);
+        drop(client_c);
     }
 }

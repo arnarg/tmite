@@ -45,6 +45,8 @@ impl PairError {
         match self {
             PairError::InvalidCode(_) => 2,
             PairError::Denied(PairDenyReason::AdminDenied) => 3,
+            PairError::Denied(PairDenyReason::Busy)
+            | PairError::Denied(PairDenyReason::Expired) => 2,
             PairError::Denied(PairDenyReason::NameTaken)
             | PairError::Denied(PairDenyReason::ServerError) => 1,
             PairError::Timeout => 4,
