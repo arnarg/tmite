@@ -132,7 +132,8 @@ paired_at = "2026-09-07T12:00:00Z"
 
 **`ntfy.toml`** (server only, optional): push-notification configuration;
 its presence enables notifications (§18). Written atomically (tempfile +
-rename) with mode `0600` by `tmite ntfy enable`:
+rename) with mode `0600` by the daemon on `ntfy.enable` (§9.2) — never by
+the admin CLI directly:
 
 ```toml
 topic  = "c4a2f09f2a41c70b3e5d1877c4a2f0aa"  # 32 hex chars; the topic is the credential
@@ -400,6 +401,10 @@ Rules:
 | `peer.rm` | `{peer, force?}` | – | `{removed: bool}` |
 | `daemon.status` | `{}` | – | `{version, node_id, uptime_secs, peers, rules, invites}` |
 | `daemon.stop` | `{}` | – | `{stopping: true}` (graceful shutdown) |
+| `ntfy.enable` | `{server?}` | – | `{topic, server_url}`; generates the topic daemon-side (§18) |
+| `ntfy.disable` | `{}` | – | `{removed: bool}` |
+| `ntfy.status` | `{}` | – | `{enabled: bool, topic?, server_url?}` |
+| `ntfy.test` | `{message?}` | – | `{sent: true}`; synchronous POST via the daemon |
 
 Error codes (string, stable): `bad_request`, `name_taken`, `not_found`, `invite_cap`, `invite_expired`, `peer_has_rules` (rm without force), `internal`.
 
@@ -592,18 +597,25 @@ Each milestone is independently demonstrable; M1–M2 are parallelizable across 
 The daemon can post events to an [ntfy](https://ntfy.sh) topic so the admin's
 phone/desktop sees them without polling `tmite status`.
 
-**Enable/disable model.** Notifications are on exactly while
-`${data_dir}/ntfy.toml` exists (§3.2). `tmite ntfy enable` generates a random
-32-hex-char topic (16 bytes from the pairing CSPRNG; valid ntfy topic
-charset), writes the file mode `0600`, and prints the subscribe URL;
-`tmite ntfy disable` removes it; `tmite ntfy topic` prints it;
-`tmite ntfy test` sends a verification notification directly from the CLI
-(no daemon involvement). There is no config file for the daemon generally;
-this one file is deliberately read **per event** by the drain task, so
-enable/disable takes effect without a daemon restart (unlike `state.toml`,
-§3.3). On ntfy.sh the topic *is* the credential — anyone who knows it can
-publish and subscribe — hence 0600 and CSPRNG entropy. A self-hosted
-`server` base URL can be given at enable time (`--server`, http/https only).
+**Enable/disable model.** All ntfy management goes through the daemon's IPC
+(§9.2, `ntfy.enable`/`ntfy.disable`/`ntfy.status`/`ntfy.test`) — consistent
+with the §3.3 invariant that all mutations flow through the daemon. The
+daemon owns `${data_dir}/ntfy.toml` and writes it atomically (tempfile +
+rename) with mode `0600`. `tmite ntfy enable` requests a topic: the daemon
+generates 32 hex chars (16 bytes from the pairing CSPRNG; valid ntfy topic
+charset), persists the file, and returns `{topic, server_url}` for the CLI
+to print as the subscribe URL. Enabling while enabled is a `bad_request`
+(no silent topic rotation); an invalid `server` scheme is rejected at
+enable time; `tmite ntfy test` does a synchronous send from the daemon so
+setup failures surface immediately. These commands therefore require a
+running daemon and the IPC-group permission on the socket — the admin CLI
+never needs read access to `/var/lib/tmite`. There is no config file for
+the daemon generally; this one file is deliberately read **per event** by
+the drain task, so enable/disable takes effect without a daemon restart
+(unlike `state.toml`, §3.3). On ntfy.sh the topic *is* the credential —
+anyone who knows it can publish and subscribe — hence 0600 and CSPRNG
+entropy. A self-hosted `server` base URL can be given at enable time
+(`--server`, http/https only).
 
 **Architecture.** Event sources never do I/O: they clone a `Notifier`
 (unbounded channel sender) into the data-plane handler, invite manager, and
@@ -631,8 +643,9 @@ cannot flood the topic. Different subjects never suppress each other.
 | rule revoked | `peer.revoke` success (removed=true) | |
 
 `peer.rm` does not notify (housekeeping; forced removal already implies rule
-loss). Notifications are not part of any wire protocol — no frame, IPC, or
-pairing changes — so no golden vectors are affected (§14.2).
+loss). Notifications add no pairing-wire changes — no frame or pairing
+changes — so golden vectors are unaffected (§14.2). The IPC method table
+(§9.2) gains the `ntfy.*` methods above.
 
 ---
 

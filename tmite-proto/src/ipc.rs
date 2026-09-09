@@ -213,6 +213,47 @@ pub struct StopResult {
     pub stopping: bool,
 }
 
+// -- ntfy.* ----------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct NtfyEnableParams {
+    /// Self-hosted ntfy server base URL (default: ntfy.sh)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NtfyEnableResult {
+    pub topic: String,
+    pub server_url: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NtfyDisableResult {
+    /// False when notifications were not enabled.
+    pub removed: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NtfyStatusResult {
+    pub enabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub topic: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub server_url: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct NtfyTestParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NtfyTestResult {
+    pub sent: bool,
+}
+
 // -- daemon.sessions -------------------------------------------------------
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -277,6 +318,10 @@ pub enum Method {
     DaemonStatus,
     DaemonSessions,
     DaemonStop,
+    NtfyEnable,
+    NtfyDisable,
+    NtfyStatus,
+    NtfyTest,
 }
 
 impl Method {
@@ -291,6 +336,10 @@ impl Method {
             Method::DaemonStatus => "daemon.status",
             Method::DaemonSessions => "daemon.sessions",
             Method::DaemonStop => "daemon.stop",
+            Method::NtfyEnable => "ntfy.enable",
+            Method::NtfyDisable => "ntfy.disable",
+            Method::NtfyStatus => "ntfy.status",
+            Method::NtfyTest => "ntfy.test",
         }
     }
 
@@ -305,6 +354,10 @@ impl Method {
             "daemon.status" => Method::DaemonStatus,
             "daemon.sessions" => Method::DaemonSessions,
             "daemon.stop" => Method::DaemonStop,
+            "ntfy.enable" => Method::NtfyEnable,
+            "ntfy.disable" => Method::NtfyDisable,
+            "ntfy.status" => Method::NtfyStatus,
+            "ntfy.test" => Method::NtfyTest,
             _ => return None,
         })
     }

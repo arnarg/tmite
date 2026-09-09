@@ -778,65 +778,50 @@ fn node_id_cmd(cli: &Cli) -> anyhow::Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// ntfy notifications
+// ntfy notifications (management goes through the daemon's IPC; §18)
 // ---------------------------------------------------------------------------
 
-/// ntfy is a daemon-host feature: like `daemon`, its data dir defaults to
-/// /var/lib/tmite, not the client XDG dir.
-fn daemon_data_dir(cli: &Cli) -> PathBuf {
-    cli.data_dir
-        .clone()
-        .unwrap_or_else(|| PathBuf::from("/var/lib/tmite"))
-}
-
 async fn ntfy_cmd(cli: &Cli, cmd: NtfyCmd) -> anyhow::Result<()> {
-    use tmite_core::daemon::notify::{NtfyConfig, generate_topic, send_test, validate_server_url};
-    let data_dir = daemon_data_dir(cli);
+    let sockets = daemon_socket_candidates(cli);
     match cmd {
         NtfyCmd::Enable { server } => {
-            if let Some(url) = &server {
-                validate_server_url(url).map_err(anyhow::Error::msg)?;
-            }
-            if let Some(existing) = NtfyConfig::load(&data_dir)? {
-                bail!(
-                    "ntfy notifications already enabled (topic {}); run `tmite ntfy disable` first to rotate",
-                    existing.topic
-                );
-            }
-            let config = NtfyConfig {
-                topic: generate_topic(),
-                server,
-            };
-            config.save(&data_dir)?;
+            let result = ipc_call(
+                &sockets,
+                "ntfy.enable",
+                serde_json::json!({ "server": server }),
+            )
+            .await?;
             println!("ntfy topic created:");
-            println!("  {}/{}", config.server_url(), config.topic);
+            println!(
+                "  {}/{}",
+                result["server_url"].as_str().unwrap_or(""),
+                result["topic"].as_str().unwrap_or("")
+            );
             println!("Subscribe to this topic to receive notifications.");
             println!("Takes effect immediately; no daemon restart needed.");
         }
         NtfyCmd::Disable => {
-            if NtfyConfig::remove(&data_dir)? {
+            let result = ipc_call(&sockets, "ntfy.disable", serde_json::json!({})).await?;
+            if result["removed"].as_bool().unwrap_or(false) {
                 println!("ntfy notifications disabled");
             } else {
                 println!("ntfy notifications were not enabled");
             }
         }
         NtfyCmd::Topic => {
-            let Some(config) = NtfyConfig::load(&data_dir)? else {
-                bail!(
-                    "ntfy notifications are disabled (no {})",
-                    NtfyConfig::path(&data_dir).display()
-                );
-            };
-            println!("{}", config.topic);
+            let result = ipc_call(&sockets, "ntfy.status", serde_json::json!({})).await?;
+            if !result["enabled"].as_bool().unwrap_or(false) {
+                bail!("ntfy notifications are disabled; run `tmite ntfy enable` first");
+            }
+            println!("{}", result["topic"].as_str().unwrap_or_default());
         }
         NtfyCmd::Test { message } => {
-            let Some(config) = NtfyConfig::load(&data_dir)? else {
-                bail!("ntfy notifications are disabled; run `tmite ntfy enable` first");
-            };
-            let message = message.unwrap_or_else(|| "ntfy notifications are working".to_string());
-            send_test(&config, &message)
-                .await
-                .map_err(anyhow::Error::msg)?;
+            ipc_call(
+                &sockets,
+                "ntfy.test",
+                serde_json::json!({ "message": message }),
+            )
+            .await?;
             println!("test notification sent");
         }
     }

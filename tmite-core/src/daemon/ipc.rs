@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -8,13 +8,14 @@ use tokio::net::UnixStream;
 use tokio::sync::mpsc;
 
 use crate::daemon::invite::InviteManager;
-use crate::daemon::notify::{Notification, Notifier};
+use crate::daemon::notify::{self, Notification, Notifier, NtfyConfig};
 use crate::daemon::sessions::Sessions;
 use crate::daemon::state::State;
 use tmite_proto::ipc::{
     self, AllowParams, AllowResult, DecideParams, ErrorCode, InviteParams, InviteResult, LsResult,
-    Method, PeerSessionInfo, Reply, Request, RevokeParams, RevokeResult, RmParams, RmResult,
-    SessionsResult, StatusResult, StopResult,
+    Method, NtfyDisableResult, NtfyEnableParams, NtfyEnableResult, NtfyStatusResult,
+    NtfyTestParams, NtfyTestResult, PeerSessionInfo, Reply, Request, RevokeParams, RevokeResult,
+    RmParams, RmResult, SessionsResult, StatusResult, StopResult,
 };
 
 pub struct DaemonHandle {
@@ -22,6 +23,8 @@ pub struct DaemonHandle {
     pub invites: Arc<InviteManager>,
     pub sessions: Sessions,
     pub notifier: Notifier,
+    /// Where the daemon keeps its files, including `ntfy.toml` (§18).
+    pub data_dir: PathBuf,
     pub node_id: String,
     pub version: String,
     pub started: Instant,
@@ -119,6 +122,10 @@ async fn dispatch(request: Request, handle: Arc<DaemonHandle>, tx: mpsc::Unbound
         Method::PeerRm => dispatch_rm(request, handle).await,
         Method::DaemonStatus => dispatch_status(handle).await,
         Method::DaemonSessions => dispatch_sessions(handle).await,
+        Method::NtfyEnable => dispatch_ntfy_enable(request, handle).await,
+        Method::NtfyDisable => dispatch_ntfy_disable(handle).await,
+        Method::NtfyStatus => dispatch_ntfy_status(handle).await,
+        Method::NtfyTest => dispatch_ntfy_test(request, handle).await,
         Method::DaemonStop => {
             let _ = handle.stop_tx.send(());
             Ok(json!(StopResult { stopping: true }))
@@ -290,4 +297,88 @@ async fn dispatch_sessions(handle: Arc<DaemonHandle>) -> Result<serde_json::Valu
         })
         .collect();
     Ok(json!(SessionsResult { peers }))
+}
+
+// -- ntfy.* (§18): all management goes through the daemon, which owns
+// `ntfy.toml`. The drain task re-reads the file per event, so changes apply
+// immediately without a restart.
+
+async fn dispatch_ntfy_enable(
+    request: Request,
+    handle: Arc<DaemonHandle>,
+) -> Result<serde_json::Value, DispatchError> {
+    let params: NtfyEnableParams =
+        serde_json::from_value(request.params).map_err(|e| err(ErrorCode::BadRequest, e))?;
+    if let Some(url) = &params.server {
+        notify::validate_server_url(url).map_err(|e| err(ErrorCode::BadRequest, e))?;
+    }
+    if let Some(existing) = ntfy_config(&handle.data_dir)? {
+        return Err(err(
+            ErrorCode::BadRequest,
+            format!(
+                "ntfy notifications already enabled (topic {}); disable first to rotate",
+                existing.topic
+            ),
+        ));
+    }
+    let config = NtfyConfig {
+        topic: notify::generate_topic(),
+        server: params.server,
+    };
+    config
+        .save(&handle.data_dir)
+        .map_err(|e| err(ErrorCode::Internal, e))?;
+    Ok(json!(NtfyEnableResult {
+        topic: config.topic.clone(),
+        server_url: config.server_url().to_string(),
+    }))
+}
+
+async fn dispatch_ntfy_disable(
+    handle: Arc<DaemonHandle>,
+) -> Result<serde_json::Value, DispatchError> {
+    let removed = NtfyConfig::remove(&handle.data_dir).map_err(|e| err(ErrorCode::Internal, e))?;
+    Ok(json!(NtfyDisableResult { removed }))
+}
+
+async fn dispatch_ntfy_status(
+    handle: Arc<DaemonHandle>,
+) -> Result<serde_json::Value, DispatchError> {
+    match ntfy_config(&handle.data_dir)? {
+        Some(config) => Ok(json!(NtfyStatusResult {
+            enabled: true,
+            topic: Some(config.topic.clone()),
+            server_url: Some(config.server_url().to_string()),
+        })),
+        None => Ok(json!(NtfyStatusResult {
+            enabled: false,
+            topic: None,
+            server_url: None,
+        })),
+    }
+}
+
+async fn dispatch_ntfy_test(
+    request: Request,
+    handle: Arc<DaemonHandle>,
+) -> Result<serde_json::Value, DispatchError> {
+    let params: NtfyTestParams =
+        serde_json::from_value(request.params).map_err(|e| err(ErrorCode::BadRequest, e))?;
+    let config = ntfy_config(&handle.data_dir)?.ok_or_else(|| {
+        err(
+            ErrorCode::BadRequest,
+            "ntfy notifications are disabled; enable first",
+        )
+    })?;
+    let message = params
+        .message
+        .unwrap_or_else(|| "ntfy notifications are working".to_string());
+    notify::send_test(&config, &message)
+        .await
+        .map_err(|e| err(ErrorCode::Internal, format!("ntfy send failed: {e}")))?;
+    Ok(json!(NtfyTestResult { sent: true }))
+}
+
+fn ntfy_config(data_dir: &Path) -> Result<Option<NtfyConfig>, DispatchError> {
+    NtfyConfig::load(data_dir).map_err(|e| err(ErrorCode::Internal, e))
 }

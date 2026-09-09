@@ -67,6 +67,7 @@ pub async fn run(cfg: DaemonConfig) -> Result<(), DaemonError> {
         invites: invites.clone(),
         sessions: sessions.clone(),
         notifier: notifier.clone(),
+        data_dir: cfg.data_dir.clone(),
         node_id: node_id.clone(),
         version: crate::CRATE_VERSION.to_string(),
         started: std::time::Instant::now(),

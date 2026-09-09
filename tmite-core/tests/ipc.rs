@@ -37,6 +37,7 @@ async fn start_daemon_ipc(dir: &tempfile::TempDir) -> (std::path::PathBuf, Arc<S
         invites,
         sessions: Default::default(),
         notifier: Notifier::disabled(),
+        data_dir: dir.path().to_path_buf(),
         node_id: "ab12".into(),
         version: "0.1.0".into(),
         started: std::time::Instant::now(),
@@ -173,4 +174,72 @@ async fn ipc_request_result_sequences() {
     c2.send(1, "daemon.status", json!({})).await;
     let r = c2.reply().await;
     assert_eq!(r["result"]["peers"], 1);
+}
+
+// ---------------------------------------------------------------------------
+// ntfy management over IPC (§18): the daemon owns `ntfy.toml`.
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn ntfy_management_over_ipc() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let (path, _state) = start_daemon_ipc(&dir).await;
+    let config_path = dir.path().join("ntfy.toml");
+
+    let mut c = connect(&path).await;
+
+    // Disabled by default.
+    c.send(1, "ntfy.status", json!({})).await;
+    let r = c.reply().await;
+    assert_eq!(r["result"]["enabled"], false);
+
+    // enable generates a topic and writes the config daemon-side (0600).
+    c.send(
+        2,
+        "ntfy.enable",
+        json!({"server": "https://ntfy.example.com"}),
+    )
+    .await;
+    let r = c.reply().await;
+    let topic = r["result"]["topic"].as_str().unwrap().to_string();
+    assert_eq!(topic.len(), 32);
+    assert_eq!(r["result"]["server_url"], "https://ntfy.example.com");
+    let stored: tmite_core::daemon::notify::NtfyConfig =
+        toml::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
+    assert_eq!(stored.topic, topic);
+    assert_eq!(stored.server.as_deref(), Some("https://ntfy.example.com"));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&config_path)
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600, "ntfy.toml must be 0600");
+    }
+
+    // Second enable is refused (no silent topic rotation).
+    c.send(3, "ntfy.enable", json!({})).await;
+    let r = c.reply().await;
+    assert_eq!(r["error"]["code"], "bad_request");
+
+    // Invalid server scheme is rejected at enable time.
+    c.send(4, "ntfy.disable", json!({})).await;
+    let r = c.reply().await;
+    assert_eq!(r["result"]["removed"], true);
+    c.send(5, "ntfy.enable", json!({"server": "ntfy.example.com"}))
+        .await;
+    let r = c.reply().await;
+    assert_eq!(r["error"]["code"], "bad_request");
+    assert!(!config_path.exists(), "failed enable must not write config");
+
+    // test while disabled → bad_request (no network access attempted).
+    c.send(6, "ntfy.test", json!({})).await;
+    let r = c.reply().await;
+    assert_eq!(r["error"]["code"], "bad_request");
+
+    // disable is idempotent: removed=false once gone.
+    c.send(7, "ntfy.disable", json!({})).await;
+    let r = c.reply().await;
+    assert_eq!(r["result"]["removed"], false);
 }
