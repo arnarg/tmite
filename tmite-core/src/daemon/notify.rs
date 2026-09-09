@@ -7,6 +7,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use ntfy::payload::Priority;
@@ -22,6 +23,15 @@ use crate::fsio;
 pub const COOLDOWN: Duration = Duration::from_secs(60);
 
 const SEND_TIMEOUT: Duration = Duration::from_secs(10);
+
+fn node_label() -> &'static str {
+    static NODE: OnceLock<String> = OnceLock::new();
+    NODE.get_or_init(|| {
+        hostname::get()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| "tmite".to_string())
+    })
+}
 pub const NTFY_CONFIG_FILE: &str = "ntfy.toml";
 pub const DEFAULT_NTFY_SERVER: &str = "https://ntfy.sh";
 
@@ -192,47 +202,49 @@ impl Notification {
     }
 
     fn payload(&self, topic: &str) -> Payload {
+        let node = node_label();
+
         match self {
             Notification::PeerConnected { name, .. } => Payload::new(topic)
-                .title("tmite: peer connected")
+                .title(format!("{node}: peer connected"))
                 .message(format!("peer {name:?} connected to the daemon"))
                 .tags(["bell"]),
             Notification::PeerRejected { node_id } => Payload::new(topic)
                 .priority(Priority::High)
-                .title("tmite: connection rejected")
+                .title(format!("{node}: connection rejected"))
                 .message(format!(
                     "unknown node {} tried to connect",
                     short_node_id(node_id)
                 ))
                 .tags(["warning", "key"]),
             Notification::PairRequested { name, node_id } => Payload::new(topic)
-                .title("tmite: pairing request")
+                .title(format!("{node}: pairing request"))
                 .message(format!(
                     "client {} wants to pair as {name:?}; approve on the daemon host",
                     short_node_id(node_id)
                 ))
                 .tags(["key"]),
             Notification::PeerRegistered { name, node_id } => Payload::new(topic)
-                .title("tmite: new peer")
+                .title(format!("{node}: new peer"))
                 .message(format!(
                     "peer {name:?} ({}) registered",
                     short_node_id(node_id)
                 ))
                 .tags(["white_check_mark"]),
             Notification::InviteCreated { name, ttl_secs, .. } => Payload::new(topic)
-                .title("tmite: invite created")
+                .title(format!("{node}: invite created"))
                 .message(format!("invite for {name:?} created (valid {ttl_secs}s)"))
                 .tags(["link"]),
             Notification::InviteExpired { .. } => Payload::new(topic)
-                .title("tmite: invite expired")
+                .title(format!("{node}: invite expired"))
                 .message("an invite expired without a pairing")
                 .tags(["hourglass"]),
             Notification::RuleAdded { peer, target } => Payload::new(topic)
-                .title("tmite: rule added")
+                .title(format!("{node}: rule added"))
                 .message(format!("peer {peer:?} may now reach {target}"))
                 .tags(["unlock"]),
             Notification::RuleRevoked { peer, target } => Payload::new(topic)
-                .title("tmite: rule revoked")
+                .title(format!("{node}: rule revoked"))
                 .message(format!("peer {peer:?} can no longer reach {target}"))
                 .tags(["lock"]),
         }
@@ -301,7 +313,7 @@ impl Sink for NtfySink {
 /// Sends the setup-verification notification behind `tmite admin ntfy test`.
 pub async fn send_test(config: &NtfyConfig, message: &str) -> Result<(), String> {
     let payload = Payload::new(&config.topic)
-        .title("tmite: test")
+        .title(format!("{}: test", node_label()))
         .message(message.to_string())
         .tags(["white_check_mark"]);
     NtfySink.post(config, &payload).await

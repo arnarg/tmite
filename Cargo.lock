@@ -1500,6 +1500,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "hostname"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "617aaa3557aef3810a6369d0a99fac8a080891b68bd9f9812a1eeda0c0730cbd"
+dependencies = [
+ "cfg-if",
+ "libc",
+ "windows-link",
+]
+
+[[package]]
 name = "http"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4415,7 +4426,7 @@ checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
 
 [[package]]
 name = "tmite"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -4436,10 +4447,11 @@ dependencies = [
 
 [[package]]
 name = "tmite-core"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "dirs",
  "hex",
+ "hostname",
  "humantime",
  "iroh",
  "n0-future",
@@ -4459,7 +4471,7 @@ dependencies = [
 
 [[package]]
 name = "tmite-proto"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "getrandom 0.3.4",
  "hex",
