@@ -231,6 +231,73 @@ async fn half_close_propagates_both_ways() {
 }
 
 // ---------------------------------------------------------------------------
+// Client-side half-close (the other important one, §14.3 / §7.5): the local
+// app's FIN must propagate through the iroh stream to the target, and the
+// target's reply must come back before the app sees EOF.
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn client_half_close_propagates() {
+    // Target behaves like sshd: reads a payload until EOF, replies, half-closes.
+    let target_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let target_addr = format!("127.0.0.1:{}", target_listener.local_addr().unwrap().port());
+    let target = tokio::spawn(async move {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let (mut sock, _) = target_listener.accept().await.unwrap();
+        let mut buf = Vec::new();
+        sock.read_to_end(&mut buf).await.unwrap();
+        assert_eq!(buf, b"abc", "target must observe FIN after payload");
+        sock.write_all(b"HELLO").await.unwrap();
+        sock.shutdown().await.unwrap();
+    });
+
+    let dir = TempDir::new().unwrap();
+    let server_sk = sk_from_byte(13);
+    let client_sk = sk_from_byte(14);
+    let (state, _) = test_state(&dir, &client_sk.public());
+    state.add_rule("laptop", &target_addr).unwrap();
+    let server = spawn_server(state, &server_sk).await;
+    let client_ep = test_endpoint(&client_sk).await;
+    let conn = connect_client(&client_ep, &server).await;
+
+    let (send, recv, reply) = open_stream(&conn, &target_addr).await.unwrap();
+    assert!(
+        matches!(reply, Some(DataFrame::Ok {})),
+        "expected OK, got {reply:?}"
+    );
+
+    // A local listener standing in for the app-facing side of `tmite connect`.
+    let local_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let local_port = local_listener.local_addr().unwrap().port();
+    let relay_task = tokio::spawn(async move {
+        let (tcp, _) = local_listener.accept().await.unwrap();
+        let tx = std::sync::atomic::AtomicU64::new(0);
+        let rx = std::sync::atomic::AtomicU64::new(0);
+        tmite_core::client::connect::relay_local(send, recv, tcp, &tx, &rx).await;
+    });
+
+    // The "local app" (like ssh): write, half-close, then read the reply.
+    let app = tokio::spawn(async move {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let mut sock = tokio::net::TcpStream::connect(("127.0.0.1", local_port))
+            .await
+            .unwrap();
+        sock.write_all(b"abc").await.unwrap();
+        sock.shutdown().await.unwrap();
+        let mut buf = Vec::new();
+        sock.read_to_end(&mut buf).await.unwrap();
+        assert_eq!(buf, b"HELLO");
+    });
+
+    tokio::time::timeout(Duration::from_secs(10), relay_task)
+        .await
+        .unwrap()
+        .unwrap();
+    app.await.unwrap();
+    target.await.unwrap();
+}
+
+// ---------------------------------------------------------------------------
 // Stream multiplexing: 64 concurrent streams over one connection (§14.3)
 // ---------------------------------------------------------------------------
 

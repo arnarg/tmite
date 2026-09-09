@@ -584,22 +584,47 @@ async fn handle_local(
             reg.admit(handle);
         }
 
-        let (mut tcp_read, mut tcp_write) = tcp.into_split();
-        let up = crate::daemon::main_ep::pump_counted(
+        relay_local(send, recv, tcp, tx_counter, rx_counter).await;
+        return;
+    }
+}
+
+/// Client-side relay with mandatory half-close propagation (§7.5), the
+/// mirror of the daemon's `relay()` (main_ep.rs): iroh stream EOF ⇄ TCP FIN
+/// in both directions. Without the `finish()` below, a local app closing its
+/// socket never propagates FIN to the target and the relay deadlocks.
+pub async fn relay_local(
+    mut send: iroh::endpoint::SendStream,
+    mut recv: iroh::endpoint::RecvStream,
+    tcp: TcpStream,
+    tx_counter: &AtomicU64,
+    rx_counter: &AtomicU64,
+) {
+    use tokio::io::AsyncWriteExt as _;
+    let (mut tcp_read, mut tcp_write) = tcp.into_split();
+    let up = async {
+        // iroh stream → local app: on stream EOF propagate FIN to the socket.
+        let res = crate::daemon::main_ep::pump_counted(
             &mut recv,
             &mut tcp_write,
             std::time::Duration::ZERO,
             rx_counter,
-        );
-        tokio::pin!(up);
-        let down = crate::daemon::main_ep::pump_counted(
+        )
+        .await;
+        let _ = tcp_write.shutdown().await;
+        res
+    };
+    let down = async {
+        // local app → iroh stream: on socket EOF propagate FIN on the stream.
+        let res = crate::daemon::main_ep::pump_counted(
             &mut tcp_read,
             &mut send,
             std::time::Duration::ZERO,
             tx_counter,
-        );
-        tokio::pin!(down);
-        let _ = tokio::join!(up, down);
-        return;
-    }
+        )
+        .await;
+        let _ = send.finish();
+        res
+    };
+    let _ = tokio::join!(up, down);
 }
