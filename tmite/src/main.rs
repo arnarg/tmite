@@ -58,13 +58,6 @@ enum Command {
         #[arg(long, default_value_t = 0)]
         idle_timeout: u64,
     },
-    /// Server admin commands (via the daemon's IPC socket)
-    Peer {
-        #[command(subcommand)]
-        cmd: PeerCmd,
-    },
-    /// Show daemon status
-    Status,
     /// Pair this client with a server using a spoken code
     Pair {
         /// The 5-word code (prompted if omitted)
@@ -90,6 +83,22 @@ enum Command {
     },
     /// Print this node's iroh NodeId
     NodeId,
+    /// Daemon admin commands (via the daemon's IPC socket)
+    Admin {
+        #[command(subcommand)]
+        cmd: AdminCmd,
+    },
+}
+
+#[derive(Clone, Subcommand)]
+enum AdminCmd {
+    /// Show daemon status
+    Status,
+    /// Manage peers, rules, and invites
+    Peers {
+        #[command(subcommand)]
+        cmd: PeersCmd,
+    },
     /// Manage ntfy push notifications (run on the daemon host)
     Ntfy {
         #[command(subcommand)]
@@ -118,7 +127,7 @@ enum NtfyCmd {
 }
 
 #[derive(Clone, Subcommand)]
-enum PeerCmd {
+enum PeersCmd {
     /// Create a pairing invite and wait for the admin's decision
     Invite {
         /// Peer name to register (becomes the ACL namespace)
@@ -184,14 +193,12 @@ async fn main() {
             .await
             .map_err(anyhow::Error::from)
         }
-        Command::Peer { cmd } => peer_cmd(cli.clone(), cmd.clone()).await,
-        Command::Status => status_cmd(&cli).await,
+        Command::Admin { cmd } => admin_cmd(cli.clone(), cmd.clone()).await,
         Command::Pair { code, name, .. } => pair_cmd(&cli, code.clone(), name.clone()).await,
         Command::Connect { name, fwd, no_tui } => {
             connect_cmd(&cli, name.clone(), fwd.clone(), *no_tui).await
         }
         Command::NodeId => node_id_cmd(&cli),
-        Command::Ntfy { cmd } => ntfy_cmd(&cli, cmd.clone()).await,
     };
 
     if let Err(e) = result {
@@ -323,11 +330,19 @@ async fn ipc_call(
 // Commands
 // ---------------------------------------------------------------------------
 
-async fn peer_cmd(cli: Cli, cmd: PeerCmd) -> anyhow::Result<()> {
+async fn admin_cmd(cli: Cli, cmd: AdminCmd) -> anyhow::Result<()> {
+    match cmd {
+        AdminCmd::Status => status_cmd(&cli).await,
+        AdminCmd::Peers { cmd } => peers_cmd(cli, cmd).await,
+        AdminCmd::Ntfy { cmd } => ntfy_cmd(&cli, cmd).await,
+    }
+}
+
+async fn peers_cmd(cli: Cli, cmd: PeersCmd) -> anyhow::Result<()> {
     let sockets = daemon_socket_candidates(&cli);
     match cmd {
-        PeerCmd::Invite { name, ttl, yes } => invite_cmd(&sockets, name, ttl, yes).await,
-        PeerCmd::Allow { peer, target } => {
+        PeersCmd::Invite { name, ttl, yes } => invite_cmd(&sockets, name, ttl, yes).await,
+        PeersCmd::Allow { peer, target } => {
             let result = ipc_call(
                 &sockets,
                 "peer.allow",
@@ -337,7 +352,7 @@ async fn peer_cmd(cli: Cli, cmd: PeerCmd) -> anyhow::Result<()> {
             println!("rule added: {result}");
             Ok(())
         }
-        PeerCmd::Revoke { peer, target } => {
+        PeersCmd::Revoke { peer, target } => {
             let result = ipc_call(
                 &sockets,
                 "peer.revoke",
@@ -355,12 +370,12 @@ async fn peer_cmd(cli: Cli, cmd: PeerCmd) -> anyhow::Result<()> {
             }
             Ok(())
         }
-        PeerCmd::Ls => {
+        PeersCmd::Ls => {
             let result = ipc_call(&sockets, "peer.ls", serde_json::json!({})).await?;
             println!("{result:#}");
             Ok(())
         }
-        PeerCmd::Rm { peer, force } => {
+        PeersCmd::Rm { peer, force } => {
             let result = ipc_call(
                 &sockets,
                 "peer.rm",
@@ -811,7 +826,7 @@ async fn ntfy_cmd(cli: &Cli, cmd: NtfyCmd) -> anyhow::Result<()> {
         NtfyCmd::Topic => {
             let result = ipc_call(&sockets, "ntfy.status", serde_json::json!({})).await?;
             if !result["enabled"].as_bool().unwrap_or(false) {
-                bail!("ntfy notifications are disabled; run `tmite ntfy enable` first");
+                bail!("ntfy notifications are disabled; run `tmite admin ntfy enable` first");
             }
             println!("{}", result["topic"].as_str().unwrap_or_default());
         }

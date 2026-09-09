@@ -1,4 +1,4 @@
-//! Live data-plane session registry backing `tmite status` (pull model):
+//! Live data-plane session registry backing `tmite admin status` (pull model):
 //! one entry per connected peer, with announced forwards (SESSION frame)
 //! and on-demand iroh path snapshots.
 

@@ -10,9 +10,9 @@ iroh connection.
 
 ```
 tmite daemon                        # on the server (systemd unit in packaging/)
-tmite peer invite --name laptop     # prints a 5-word code, waits
+tmite admin peers invite --name laptop     # prints a 5-word code, waits
 tmite pair "ocean pixel falcon ..." # on the laptop
-tmite peer allow laptop localhost:22
+tmite admin peers allow laptop localhost:22
 tmite connect laptop --fwd 2222:localhost:22
 ssh -p 2222 localhost               # from anywhere; no open ports on either side
 ```

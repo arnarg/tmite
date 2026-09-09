@@ -96,7 +96,7 @@ impl NtfyConfig {
 }
 
 /// Rejects a `--server` value that cannot be an ntfy base URL at
-/// `tmite ntfy enable` time, so setup failures surface immediately.
+/// `tmite admin ntfy enable` time, so setup failures surface immediately.
 pub fn validate_server_url(url: &str) -> Result<(), String> {
     if url.starts_with("http://") || url.starts_with("https://") {
         Ok(())
@@ -298,7 +298,7 @@ impl Sink for NtfySink {
     }
 }
 
-/// Sends the setup-verification notification behind `tmite ntfy test`.
+/// Sends the setup-verification notification behind `tmite admin ntfy test`.
 pub async fn send_test(config: &NtfyConfig, message: &str) -> Result<(), String> {
     let payload = Payload::new(&config.topic)
         .title("tmite: test")
@@ -334,7 +334,7 @@ impl Cooldown {
 }
 
 /// Drain loop: one task per daemon, spawned by `daemon::run`. Re-reads
-/// `ntfy.toml` before every send, so `tmite ntfy enable`/`disable` take
+/// `ntfy.toml` before every send, so `tmite admin ntfy enable`/`disable` take
 /// effect without a daemon restart.
 pub async fn drain<S: Sink>(
     mut rx: mpsc::UnboundedReceiver<Notification>,

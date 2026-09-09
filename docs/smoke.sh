@@ -25,15 +25,15 @@ case "${1:-}" in
     tmite daemon $SRV_ARGS
     ;;
   invite)
-    tmite peer invite $SRV_ARGS --name laptop
+    tmite admin peers invite $SRV_ARGS --name laptop
     ;;
   pair)
     # Run on the laptop with the code from `invite`.
     tmite pair "${2:?usage: smoke.sh pair CODE}"
     ;;
   allow)
-    tmite peer allow $SRV_ARGS laptop localhost:22
-    tmite status $SRV_ARGS
+    tmite admin peers allow $SRV_ARGS laptop localhost:22
+    tmite admin status $SRV_ARGS
     ;;
   connect)
     tmite connect laptop --fwd 2222:localhost:22

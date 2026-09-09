@@ -4415,7 +4415,7 @@ checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
 
 [[package]]
 name = "tmite"
-version = "0.8.1"
+version = "0.9.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -4436,7 +4436,7 @@ dependencies = [
 
 [[package]]
 name = "tmite-core"
-version = "0.8.1"
+version = "0.9.0"
 dependencies = [
  "dirs",
  "hex",
@@ -4459,7 +4459,7 @@ dependencies = [
 
 [[package]]
 name = "tmite-proto"
-version = "0.8.1"
+version = "0.9.0"
 dependencies = [
  "getrandom 0.3.4",
  "hex",

@@ -11,7 +11,7 @@
 
 `tmite` creates temporary forwarding tunnels between two machines over [iroh](https://crates.io/crates/iroh). A long-lived daemon runs on a server with a persistent iroh identity. Laptops and workstations pair with it once (using a 5-word spoken code), after which the admin can grant them access to specific TCP endpoints on the server. The client runs local listeners; traffic entering a listener is carried over an encrypted, hole-punched iroh connection to the server, which relays it to the configured target.
 
-Typical use: run `tmite daemon` on your VPS, pair your laptop, `tmite peer allow laptop localhost:22`, then `tmite connect laptop --fwd 2222:localhost:22` and `ssh -p 2222 localhost` from anywhere, with no open ports on either side.
+Typical use: run `tmite daemon` on your VPS, pair your laptop, `tmite admin peers allow laptop localhost:22`, then `tmite connect laptop --fwd 2222:localhost:22` and `ssh -p 2222 localhost` from anywhere, with no open ports on either side.
 
 ### 1.1 Goals
 
@@ -246,7 +246,7 @@ Waiting for the server admin to confirm...
   ab12ef34 ...
 ```
 
-**Server admin's terminal** (`tmite peer invite`), on `pair_request` event:
+**Server admin's terminal** (`tmite admin peers invite`), on `pair_request` event:
 
 ```
 Pairing request from client:
@@ -254,7 +254,7 @@ Pairing request from client:
 Pair this client? [y/N]
 ```
 
-The NodeId is printed in full, lowercase hex, grouped in 8-char blocks, no truncation. The admin compares the two screens; both terminals are typically the same human over one SSH session, which is the intended deployment. `tmite peer invite --yes` skips the prompt for scripting (documented as weakening the check).
+The NodeId is printed in full, lowercase hex, grouped in 8-char blocks, no truncation. The admin compares the two screens; both terminals are typically the same human over one SSH session, which is the intended deployment. `tmite admin peers invite --yes` skips the prompt for scripting (documented as weakening the check).
 
 **Decision (D-NAME):** names are chosen by the admin at invite time (`--name`, required). Client-chosen names are rejected: the name is the ACL namespace and belongs to the admin.
 
@@ -357,12 +357,12 @@ Listeners bind at startup (fail fast on port conflicts). The client wraps the se
 Admin CLI surface (all via IPC):
 
 ```
-tmite peer allow <peer> <target>      # add rule
-tmite peer revoke <peer> <target>     # remove one rule
-tmite peer ls                         # peers + rules + pending invites
-tmite peer rm <peer> [--force]        # delete peer (and rules with --force)
-tmite peer invite --name <name> [--ttl SECS]
-tmite status                          # uptime, node id, version, peer/rule/invite counts
+tmite admin peers allow <peer> <target>      # add rule
+tmite admin peers revoke <peer> <target>     # remove one rule
+tmite admin peers ls                         # peers + rules + pending invites
+tmite admin peers rm <peer> [--force]        # delete peer (and rules with --force)
+tmite admin peers invite --name <name> [--ttl SECS]
+tmite admin status                          # uptime, node id, version, peer/rule/invite counts
 ```
 
 ---
@@ -412,7 +412,7 @@ Error codes (string, stable): `bad_request`, `name_taken`, `not_found`, `invite_
 
 ### 9.3 CLI prompt hygiene
 
-`tmite peer invite` reads `y/N` from `/dev/tty` (not stdin) so piped input can't auto-confirm; if no TTY and no `--yes`, fail with exit 1 rather than guessing. Ctrl-C closes the socket → daemon cancels the invite (§6.3).
+`tmite admin peers invite` reads `y/N` from `/dev/tty` (not stdin) so piped input can't auto-confirm; if no TTY and no `--yes`, fail with exit 1 rather than guessing. Ctrl-C closes the socket → daemon cancels the invite (§6.3).
 
 ---
 
@@ -423,8 +423,8 @@ Single binary `tmite`; clap-derive; global flags: `-v/-vv` (tracing to stderr; `
 | Command | Runs on | Behavior |
 |---|---|---|
 | `tmite daemon [--relay URL]... [--pkarr URL] [--idle-timeout SECS]` | server | Foreground process; systemd unit runs it. Logs via `tracing-subscriber` (journald-friendly single-line format) |
-| `tmite peer invite --name N [--ttl S] [--yes]` | server | IPC; hangs through the whole flow (§5–6); prints code immediately |
-| `tmite peer allow/revoke/ls/rm`, `tmite status` | server | One-shot IPC; print result; exit per §10.1 |
+| `tmite admin peers invite --name N [--ttl S] [--yes]` | server | IPC; hangs through the whole flow (§5–6); prints code immediately |
+| `tmite admin peers allow/revoke/ls/rm`, `tmite admin status` | server | One-shot IPC; print result; exit per §10.1 |
 | `tmite pair [CODE] [--yes] [--name ALIAS]` | client | §5; prompts for code if absent and stdin is a TTY (3 rounds); `--name` sets the local alias stored in `servers.toml` (defaults to the server-chosen peer name) |
 | `tmite connect <name> --fwd SPEC...` | client | §7.4; blocks until Ctrl-C |
 | `tmite node-id` | both | Print this node's NodeId (grouped hex) and exit — used in docs/tests |
@@ -595,18 +595,18 @@ Each milestone is independently demonstrable; M1–M2 are parallelizable across 
 ## 18. Push notifications (ntfy)
 
 The daemon can post events to an [ntfy](https://ntfy.sh) topic so the admin's
-phone/desktop sees them without polling `tmite status`.
+phone/desktop sees them without polling `tmite admin status`.
 
 **Enable/disable model.** All ntfy management goes through the daemon's IPC
 (§9.2, `ntfy.enable`/`ntfy.disable`/`ntfy.status`/`ntfy.test`) — consistent
 with the §3.3 invariant that all mutations flow through the daemon. The
 daemon owns `${data_dir}/ntfy.toml` and writes it atomically (tempfile +
-rename) with mode `0600`. `tmite ntfy enable` requests a topic: the daemon
+rename) with mode `0600`. `tmite admin ntfy enable` requests a topic: the daemon
 generates 32 hex chars (16 bytes from the pairing CSPRNG; valid ntfy topic
 charset), persists the file, and returns `{topic, server_url}` for the CLI
 to print as the subscribe URL. Enabling while enabled is a `bad_request`
 (no silent topic rotation); an invalid `server` scheme is rejected at
-enable time; `tmite ntfy test` does a synchronous send from the daemon so
+enable time; `tmite admin ntfy test` does a synchronous send from the daemon so
 setup failures surface immediately. These commands therefore require a
 running daemon and the IPC-group permission on the socket — the admin CLI
 never needs read access to `/var/lib/tmite`. There is no config file for
