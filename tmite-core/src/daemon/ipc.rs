@@ -8,6 +8,7 @@ use tokio::net::UnixStream;
 use tokio::sync::mpsc;
 
 use crate::daemon::invite::InviteManager;
+use crate::daemon::notify::{Notification, Notifier};
 use crate::daemon::sessions::Sessions;
 use crate::daemon::state::State;
 use tmite_proto::ipc::{
@@ -20,6 +21,7 @@ pub struct DaemonHandle {
     pub state: Arc<State>,
     pub invites: Arc<InviteManager>,
     pub sessions: Sessions,
+    pub notifier: Notifier,
     pub node_id: String,
     pub version: String,
     pub started: Instant,
@@ -199,6 +201,10 @@ async fn dispatch_allow(
         .state
         .add_rule(&params.peer, &params.target)
         .map_err(|e| (e.error_code(), e.to_string()))?;
+    handle.notifier.notify(Notification::RuleAdded {
+        peer: params.peer.clone(),
+        target: params.target.clone(),
+    });
     Ok(json!(AllowResult { rule_index: index }))
 }
 
@@ -212,6 +218,12 @@ async fn dispatch_revoke(
         .state
         .remove_rule(&params.peer, &params.target)
         .map_err(|e| (e.error_code(), e.to_string()))?;
+    if removed {
+        handle.notifier.notify(Notification::RuleRevoked {
+            peer: params.peer.clone(),
+            target: params.target.clone(),
+        });
+    }
     Ok(json!(RevokeResult { removed }))
 }
 

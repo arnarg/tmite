@@ -8,6 +8,7 @@ use iroh::protocol::Router;
 use iroh::{Endpoint, EndpointAddr, PublicKey, SecretKey};
 use tempfile::TempDir;
 use tmite_core::daemon::main_ep::DataPlaneHandler;
+use tmite_core::daemon::notify::{Notification, Notifier};
 use tmite_core::daemon::sessions::Sessions;
 use tmite_core::daemon::state::State;
 use tmite_proto::alpn::DATA_ALPN;
@@ -49,12 +50,20 @@ struct Server {
 }
 
 async fn spawn_server(state: Arc<State>, sk: &SecretKey) -> Server {
+    spawn_server_with_notifier(state, sk, Notifier::disabled()).await
+}
+
+async fn spawn_server_with_notifier(
+    state: Arc<State>,
+    sk: &SecretKey,
+    notifier: Notifier,
+) -> Server {
     let endpoint = test_endpoint(sk).await;
     let sessions = Sessions::new();
     let router = Router::builder(endpoint.clone())
         .accept(
             DATA_ALPN,
-            DataPlaneHandler::new(state, sessions.clone(), Duration::ZERO),
+            DataPlaneHandler::new(state, sessions.clone(), Duration::ZERO, notifier),
         )
         .spawn();
     // Wait for the direct address to be known.
@@ -426,6 +435,33 @@ async fn unknown_peer_closed_without_reply() {
         Ok(Ok(_)) => panic!("attacker received a reply"),
         Ok(Err(_)) => { /* stream reset/closed: good */ }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Unknown peer: rejected connection reaches the notification sink (§18)
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn unknown_peer_rejection_notifies() {
+    let dir = TempDir::new().unwrap();
+    let server_sk = sk_from_byte(11);
+    let (state, _) = test_state(&dir, &server_sk.public());
+    let (notifier, mut rx) = Notifier::channel();
+    let server = spawn_server_with_notifier(state, &server_sk, notifier).await;
+
+    let attacker = test_endpoint(&sk_from_byte(12)).await;
+    let addr = EndpointAddr::new(server.node_id).with_ip_addr(server.addr);
+    let _conn = attacker.connect(addr, DATA_ALPN).await.unwrap();
+
+    let notification = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+        .await
+        .expect("no notification within 10s");
+    assert_eq!(
+        notification,
+        Some(Notification::PeerRejected {
+            node_id: attacker.id().to_string(),
+        })
+    );
 }
 
 // ---------------------------------------------------------------------------

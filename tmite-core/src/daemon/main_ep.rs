@@ -8,6 +8,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 
+use crate::daemon::notify::{Notification, Notifier};
 use crate::daemon::sessions::{AnnouncedForward, SessionEntry, Sessions};
 use crate::daemon::state::State;
 use crate::net::RejectDelay;
@@ -21,15 +22,22 @@ use tmite_proto::limits;
 pub struct DataPlaneHandler {
     state: Arc<State>,
     sessions: Sessions,
+    notifier: Notifier,
     reject_delay: Mutex<RejectDelay>,
     idle_timeout: Duration,
 }
 
 impl DataPlaneHandler {
-    pub fn new(state: Arc<State>, sessions: Sessions, idle_timeout: Duration) -> Self {
+    pub fn new(
+        state: Arc<State>,
+        sessions: Sessions,
+        idle_timeout: Duration,
+        notifier: Notifier,
+    ) -> Self {
         Self {
             state,
             sessions,
+            notifier,
             reject_delay: Mutex::new(RejectDelay::new()),
             idle_timeout,
         }
@@ -44,6 +52,9 @@ impl ProtocolHandler for DataPlaneHandler {
         let Some(peer) = self.state.peer_by_node(&node_id) else {
             let mut delay = self.reject_delay.lock().await;
             tracing::warn!("rejecting unknown peer {node_id}");
+            self.notifier.notify(Notification::PeerRejected {
+                node_id: node_id.clone(),
+            });
             tokio::time::sleep(delay.delay()).await;
             delay.escalate();
             drop(delay);
@@ -54,6 +65,10 @@ impl ProtocolHandler for DataPlaneHandler {
         self.reject_delay.lock().await.reset();
         tracing::info!(peer = %peer.name, %node_id, "data-plane session established");
         self.state.touch_last_seen(&node_id);
+        self.notifier.notify(Notification::PeerConnected {
+            name: peer.name.clone(),
+            node_id: node_id.clone(),
+        });
 
         let entry = SessionEntry::new(peer.name.clone(), node_id.clone(), conn.clone());
         self.sessions.register(entry.clone());
@@ -328,6 +343,7 @@ pub async fn spawn_main_endpoint(
     idle_timeout: Duration,
     net_opts: &crate::net::NetOpts,
     secret_key: iroh::SecretKey,
+    notifier: Notifier,
 ) -> Result<(Router, iroh::Endpoint), super::DaemonError> {
     let endpoint = crate::net::build_endpoint(
         secret_key,
@@ -337,7 +353,7 @@ pub async fn spawn_main_endpoint(
     )
     .await
     .map_err(|e| super::DaemonError::Endpoint(e.to_string()))?;
-    let handler = DataPlaneHandler::new(state, sessions, idle_timeout);
+    let handler = DataPlaneHandler::new(state, sessions, idle_timeout, notifier);
     let router = Router::builder(endpoint.clone())
         .accept(DATA_ALPN, handler)
         .spawn();

@@ -8,6 +8,7 @@ license.workspace = true
 tmite-proto.workspace = true
 tokio.workspace = true
 iroh.workspace = true
+ntfy.workspace = true
 n0-future = "0.3"
 serde.workspace = true
 serde_json.workspace = true

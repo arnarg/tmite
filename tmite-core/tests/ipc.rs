@@ -12,6 +12,7 @@ use tokio::sync::mpsc;
 
 use tmite_core::daemon::invite::InviteManager;
 use tmite_core::daemon::ipc::{DaemonHandle, serve};
+use tmite_core::daemon::notify::Notifier;
 use tmite_core::daemon::state::State;
 
 async fn start_daemon_ipc(dir: &tempfile::TempDir) -> (std::path::PathBuf, Arc<State>) {
@@ -28,12 +29,14 @@ async fn start_daemon_ipc(dir: &tempfile::TempDir) -> (std::path::PathBuf, Arc<S
         Default::default(),
         state.clone(),
         iroh::SecretKey::from_bytes(&[7u8; 32]).public(),
+        Notifier::disabled(),
     ));
     let (stop_tx, _stop_rx) = mpsc::unbounded_channel();
     let handle = Arc::new(DaemonHandle {
         state: state.clone(),
         invites,
         sessions: Default::default(),
+        notifier: Notifier::disabled(),
         node_id: "ab12".into(),
         version: "0.1.0".into(),
         started: std::time::Instant::now(),

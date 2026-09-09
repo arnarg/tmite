@@ -7,6 +7,7 @@ use serde_json::json;
 use tokio::sync::{Mutex, Notify, mpsc, oneshot};
 use zeroize::Zeroizing;
 
+use crate::daemon::notify::{Notification, Notifier};
 use crate::daemon::state::{Peer, State};
 use crate::fsio;
 use crate::net::{EndpointRole, NetOpts, RejectDelay, build_endpoint};
@@ -81,6 +82,7 @@ pub struct InviteShared {
     result_tx: Mutex<Option<oneshot::Sender<InviteResult>>>,
     outcome_tx: mpsc::UnboundedSender<Outcome>,
     event_tx: mpsc::UnboundedSender<Reply>,
+    notifier: Notifier,
     request_id: u64,
     delay: Mutex<RejectDelay>,
     peer_recorded: Mutex<bool>,
@@ -138,15 +140,22 @@ pub struct InviteManager {
     state: Arc<State>,
     server_node_id: PublicKey,
     entries: Entries,
+    notifier: Notifier,
 }
 
 impl InviteManager {
-    pub fn new(net_opts: NetOpts, state: Arc<State>, server_node_id: PublicKey) -> Self {
+    pub fn new(
+        net_opts: NetOpts,
+        state: Arc<State>,
+        server_node_id: PublicKey,
+        notifier: Notifier,
+    ) -> Self {
         Self {
             net_opts,
             state,
             server_node_id,
             entries: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            notifier,
         }
     }
 
@@ -212,6 +221,7 @@ impl InviteManager {
             result_tx: Mutex::new(Some(result_tx)),
             outcome_tx,
             event_tx,
+            notifier: self.notifier.clone(),
             request_id,
             delay: Mutex::new(RejectDelay::new()),
             peer_recorded: Mutex::new(false),
@@ -230,6 +240,11 @@ impl InviteManager {
 
         let opts = self.net_opts.clone();
         let task_name = name.to_string();
+        self.notifier.notify(Notification::InviteCreated {
+            name: task_name.clone(),
+            invite_id: invite_id.clone(),
+            ttl_secs,
+        });
         tokio::spawn(run_invite_endpoint(
             shared,
             secret_key,
@@ -397,6 +412,9 @@ async fn invite_serve(
         Some(Outcome::Rejected) => shared.finish(InviteResult::Rejected).await,
         Some(Outcome::Expired) => {
             shared.emit("expired", json!({}));
+            shared.notifier.notify(Notification::InviteExpired {
+                invite_id: shared.invite_id.clone(),
+            });
             shared.finish(InviteResult::Expired).await;
         }
         _ => shared.finish(InviteResult::Expired).await,
@@ -508,6 +526,10 @@ async fn handle_pair_conn_inner(conn: Connection, shared: &InviteShared) {
             node_id: remote.to_string(),
         }),
     );
+    shared.notifier.notify(Notification::PairRequested {
+        name: shared.name.clone(),
+        node_id: remote.to_string(),
+    });
 
     // A client is waiting; apply decision or timeouts (§5.3, §6.5). The
     // recv read detects a client that disconnects while waiting so it cannot
@@ -563,6 +585,10 @@ async fn handle_pair_conn_inner(conn: Connection, shared: &InviteShared) {
                     Ok(()) => {
                         *recorded = true;
                         drop(recorded);
+                        shared.notifier.notify(Notification::PeerRegistered {
+                            name: shared.name.clone(),
+                            node_id: remote.to_string(),
+                        });
                         {
                             shared.delay.lock().await.reset();
                         }
@@ -640,6 +666,7 @@ mod tests {
             result_tx: Mutex::new(Some(result_tx)),
             outcome_tx,
             event_tx,
+            notifier: Notifier::disabled(),
             request_id: 1,
             delay: Mutex::new(RejectDelay::new()),
             peer_recorded: Mutex::new(false),

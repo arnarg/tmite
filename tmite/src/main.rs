@@ -90,6 +90,31 @@ enum Command {
     },
     /// Print this node's iroh NodeId
     NodeId,
+    /// Manage ntfy push notifications (run on the daemon host)
+    Ntfy {
+        #[command(subcommand)]
+        cmd: NtfyCmd,
+    },
+}
+
+#[derive(Clone, Subcommand)]
+enum NtfyCmd {
+    /// Enable notifications with a fresh random topic
+    Enable {
+        /// Self-hosted ntfy server base URL (default: https://ntfy.sh)
+        #[arg(long)]
+        server: Option<String>,
+    },
+    /// Disable notifications (removes the topic)
+    Disable,
+    /// Print the notification topic
+    Topic,
+    /// Send a test notification to verify setup
+    Test {
+        /// Custom message body
+        #[arg(long)]
+        message: Option<String>,
+    },
 }
 
 #[derive(Clone, Subcommand)]
@@ -166,6 +191,7 @@ async fn main() {
             connect_cmd(&cli, name.clone(), fwd.clone(), *no_tui).await
         }
         Command::NodeId => node_id_cmd(&cli),
+        Command::Ntfy { cmd } => ntfy_cmd(&cli, cmd.clone()).await,
     };
 
     if let Err(e) = result {
@@ -748,5 +774,71 @@ fn node_id_cmd(cli: &Cli) -> anyhow::Result<()> {
     let keypair = load_or_create_keypair(&data_dir.join("keypair"))?;
     let id = keypair.public();
     println!("{}", grouped_hex(&id.as_bytes()[..]));
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// ntfy notifications
+// ---------------------------------------------------------------------------
+
+/// ntfy is a daemon-host feature: like `daemon`, its data dir defaults to
+/// /var/lib/tmite, not the client XDG dir.
+fn daemon_data_dir(cli: &Cli) -> PathBuf {
+    cli.data_dir
+        .clone()
+        .unwrap_or_else(|| PathBuf::from("/var/lib/tmite"))
+}
+
+async fn ntfy_cmd(cli: &Cli, cmd: NtfyCmd) -> anyhow::Result<()> {
+    use tmite_core::daemon::notify::{NtfyConfig, generate_topic, send_test, validate_server_url};
+    let data_dir = daemon_data_dir(cli);
+    match cmd {
+        NtfyCmd::Enable { server } => {
+            if let Some(url) = &server {
+                validate_server_url(url).map_err(anyhow::Error::msg)?;
+            }
+            if let Some(existing) = NtfyConfig::load(&data_dir)? {
+                bail!(
+                    "ntfy notifications already enabled (topic {}); run `tmite ntfy disable` first to rotate",
+                    existing.topic
+                );
+            }
+            let config = NtfyConfig {
+                topic: generate_topic(),
+                server,
+            };
+            config.save(&data_dir)?;
+            println!("ntfy topic created:");
+            println!("  {}/{}", config.server_url(), config.topic);
+            println!("Subscribe to this topic to receive notifications.");
+            println!("Takes effect immediately; no daemon restart needed.");
+        }
+        NtfyCmd::Disable => {
+            if NtfyConfig::remove(&data_dir)? {
+                println!("ntfy notifications disabled");
+            } else {
+                println!("ntfy notifications were not enabled");
+            }
+        }
+        NtfyCmd::Topic => {
+            let Some(config) = NtfyConfig::load(&data_dir)? else {
+                bail!(
+                    "ntfy notifications are disabled (no {})",
+                    NtfyConfig::path(&data_dir).display()
+                );
+            };
+            println!("{}", config.topic);
+        }
+        NtfyCmd::Test { message } => {
+            let Some(config) = NtfyConfig::load(&data_dir)? else {
+                bail!("ntfy notifications are disabled; run `tmite ntfy enable` first");
+            };
+            let message = message.unwrap_or_else(|| "ntfy notifications are working".to_string());
+            send_test(&config, &message)
+                .await
+                .map_err(anyhow::Error::msg)?;
+            println!("test notification sent");
+        }
+    }
     Ok(())
 }

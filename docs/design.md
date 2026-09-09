@@ -130,6 +130,15 @@ node_id   = "ab12..."                     # server's NodeId, pinned after pairin
 paired_at = "2026-09-07T12:00:00Z"
 ```
 
+**`ntfy.toml`** (server only, optional): push-notification configuration;
+its presence enables notifications (§18). Written atomically (tempfile +
+rename) with mode `0600` by `tmite ntfy enable`:
+
+```toml
+topic  = "c4a2f09f2a41c70b3e5d1877c4a2f0aa"  # 32 hex chars; the topic is the credential
+server = "https://ntfy.sh"                   # optional; defaults to ntfy.sh
+```
+
 A client may hold entries for any number of servers; `connect <name>` selects
 among them. The alias is chosen by the client (`tmite pair --name`, defaulting
 to the server-chosen peer name) and is independent of the server-side peer
@@ -575,6 +584,55 @@ The code→identity path is the inter-party contract. Commit `vectors/pairing.js
 5. **M5 — hardening:** reject delays, limits, full integration suite, systemd unit, README.
 
 Each milestone is independently demonstrable; M1–M2 are parallelizable across two implementers.
+
+---
+
+## 18. Push notifications (ntfy)
+
+The daemon can post events to an [ntfy](https://ntfy.sh) topic so the admin's
+phone/desktop sees them without polling `tmite status`.
+
+**Enable/disable model.** Notifications are on exactly while
+`${data_dir}/ntfy.toml` exists (§3.2). `tmite ntfy enable` generates a random
+32-hex-char topic (16 bytes from the pairing CSPRNG; valid ntfy topic
+charset), writes the file mode `0600`, and prints the subscribe URL;
+`tmite ntfy disable` removes it; `tmite ntfy topic` prints it;
+`tmite ntfy test` sends a verification notification directly from the CLI
+(no daemon involvement). There is no config file for the daemon generally;
+this one file is deliberately read **per event** by the drain task, so
+enable/disable takes effect without a daemon restart (unlike `state.toml`,
+§3.3). On ntfy.sh the topic *is* the credential — anyone who knows it can
+publish and subscribe — hence 0600 and CSPRNG entropy. A self-hosted
+`server` base URL can be given at enable time (`--server`, http/https only).
+
+**Architecture.** Event sources never do I/O: they clone a `Notifier`
+(unbounded channel sender) into the data-plane handler, invite manager, and
+`DaemonHandle`. One drain task (spawned by `daemon::run`) receives
+`Notification` values, re-reads `ntfy.toml`, applies the cooldown, and POSTs
+via the `ntfy` crate (async `Dispatcher`, 10 s timeout). Delivery failures
+are logged and dropped; they never block the data plane or fail a request.
+
+**Cooldown.** Notifications with the same (event kind, subject) pair are
+suppressed for 60 s — subject being peer name, node id, invite id, or
+`peer/target` for rules — so a reconnecting peer or an attacker retry loop
+cannot flood the topic. Different subjects never suppress each other.
+
+**Events.**
+
+| Event | Source | Notes |
+|---|---|---|
+| peer connected | data plane, after peer-table hit | includes peer name |
+| connection rejected | data plane, unknown `remote_id` | priority high; security signal |
+| pairing request | invite, at `pair_request` | informational (v1): approval still happens on the daemon host via the IPC prompt |
+| peer registered | invite, after `add_peer` succeeds | |
+| invite created | `peer.invite` accepted for processing | includes TTL |
+| invite expired | invite loop, `Outcome::Expired` | |
+| rule added | `peer.allow` success | |
+| rule revoked | `peer.revoke` success (removed=true) | |
+
+`peer.rm` does not notify (housekeeping; forced removal already implies rule
+loss). Notifications are not part of any wire protocol — no frame, IPC, or
+pairing changes — so no golden vectors are affected (§14.2).
 
 ---
 

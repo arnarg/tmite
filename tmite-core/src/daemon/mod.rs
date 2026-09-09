@@ -15,6 +15,7 @@ use crate::net::NetOpts;
 pub mod invite;
 pub mod ipc;
 pub mod main_ep;
+pub mod notify;
 pub mod sessions;
 pub mod state;
 
@@ -48,10 +49,16 @@ pub async fn run(cfg: DaemonConfig) -> Result<(), DaemonError> {
 
     let state = Arc::new(State::load(&cfg.data_dir.join("state.toml"))?);
     let sessions = Sessions::new();
+
+    let (notifier, ntfy_rx) = notify::Notifier::channel();
+    let ntfy_data_dir = cfg.data_dir.clone();
+    tokio::spawn(notify::drain(ntfy_rx, ntfy_data_dir, notify::NtfySink));
+
     let invites = Arc::new(InviteManager::new(
         cfg.net_opts.clone(),
         state.clone(),
         secret_key.public(),
+        notifier.clone(),
     ));
 
     let (stop_tx, mut stop_rx) = mpsc::unbounded_channel();
@@ -59,6 +66,7 @@ pub async fn run(cfg: DaemonConfig) -> Result<(), DaemonError> {
         state: state.clone(),
         invites: invites.clone(),
         sessions: sessions.clone(),
+        notifier: notifier.clone(),
         node_id: node_id.clone(),
         version: crate::CRATE_VERSION.to_string(),
         started: std::time::Instant::now(),
@@ -79,6 +87,7 @@ pub async fn run(cfg: DaemonConfig) -> Result<(), DaemonError> {
         cfg.idle_timeout,
         &cfg.net_opts,
         secret_key,
+        notifier.clone(),
     )
     .await?;
 
