@@ -153,6 +153,12 @@ pub struct ServerEntry {
     pub name: String,
     pub node_id: String,
     pub paired_at: String,
+    /// Default forward specs (raw `[LOCAL_ADDR:]LOCAL_PORT:TARGET` strings)
+    /// used by `tmite connect` when no `--fwd` flags are given. Empty
+    /// `forwards` is omitted from TOML for backward compatibility with
+    /// files written before this field existed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub forwards: Vec<String>,
 }
 
 impl ClientStore {
@@ -203,6 +209,18 @@ impl ClientStore {
 
     pub fn get_by_node_id(&self, node_id: &str) -> Option<&ServerEntry> {
         self.servers.iter().find(|s| s.node_id == node_id)
+    }
+
+    /// Replaces the default forward specs for a server by name. Returns
+    /// `false` if no server with that name is paired.
+    pub fn set_forwards(&mut self, name: &str, forwards: Vec<String>) -> bool {
+        match self.servers.iter_mut().find(|s| s.name == name) {
+            Some(entry) => {
+                entry.forwards = forwards;
+                true
+            }
+            None => false,
+        }
     }
 }
 

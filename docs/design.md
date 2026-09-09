@@ -128,7 +128,14 @@ version = 1
 name      = "mybox"                       # local alias, used in `tmite connect mybox`
 node_id   = "ab12..."                     # server's NodeId, pinned after pairing
 paired_at = "2026-09-07T12:00:00Z"
+forwards  = ["2222:localhost:22"]         # optional default forward specs (§7)
 ```
+
+When `tmite connect` is invoked without `--fwd`, the saved `forwards` for the
+selected server are used (validated exactly like explicit `--fwd` specs);
+passing any `--fwd` replaces the defaults for that invocation. `connect
+--save-defaults` persists the given `--fwd` specs as the server's defaults
+(or clears them when no `--fwd` is given).
 
 **`ntfy.toml`** (server only, optional): push-notification configuration;
 its presence enables notifications (§18). Written atomically (tempfile +

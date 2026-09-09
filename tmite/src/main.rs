@@ -9,7 +9,8 @@ use tmite_core::client::connect::{ConnectParams, parse_fwd_spec};
 use tmite_core::client::pair::{PairParams, PairUi};
 use tmite_core::daemon::{DaemonConfig, run as daemon_run};
 use tmite_core::fsio::{
-    candidate_socket_paths, default_client_data_dir, default_socket_path, load_or_create_keypair,
+    ClientStore, candidate_socket_paths, default_client_data_dir, default_socket_path,
+    load_or_create_keypair, servers_toml_path,
 };
 use tmite_core::net::{NetOpts, grouped_hex};
 use tokio::sync::{Notify, mpsc};
@@ -73,9 +74,14 @@ enum Command {
     Connect {
         /// Server alias from pairing
         name: String,
-        /// Forward spec: [LOCAL_ADDR:]LOCAL_PORT:TARGET (repeatable)
+        /// Forward spec: [LOCAL_ADDR:]LOCAL_PORT:TARGET (repeatable;
+        /// replaces any saved default forwards)
         #[arg(long = "fwd")]
         fwd: Vec<String>,
+        /// Save the given --fwd specs as this server's default forwards
+        /// (or clear them when no --fwd is given)
+        #[arg(long)]
+        save_defaults: bool,
         /// Disable the live TUI (paths, forwards, connections); implied
         /// when stdout is not a terminal
         #[arg(long)]
@@ -195,9 +201,12 @@ async fn main() {
         }
         Command::Admin { cmd } => admin_cmd(cli.clone(), cmd.clone()).await,
         Command::Pair { code, name, .. } => pair_cmd(&cli, code.clone(), name.clone()).await,
-        Command::Connect { name, fwd, no_tui } => {
-            connect_cmd(&cli, name.clone(), fwd.clone(), *no_tui).await
-        }
+        Command::Connect {
+            name,
+            fwd,
+            save_defaults,
+            no_tui,
+        } => connect_cmd(&cli, name.clone(), fwd.clone(), *save_defaults, *no_tui).await,
         Command::NodeId => node_id_cmd(&cli),
     };
 
@@ -745,13 +754,39 @@ async fn connect_cmd(
     cli: &Cli,
     name: String,
     fwd: Vec<String>,
+    save_defaults: bool,
     no_tui: bool,
 ) -> anyhow::Result<()> {
-    if fwd.is_empty() {
-        bail!("at least one --fwd spec is required");
+    let data_dir = client_data_dir(cli)?;
+    let servers_path = servers_toml_path(&data_dir);
+    let mut store = ClientStore::load(&servers_path)?;
+    if store.get(&name).is_none() {
+        bail!("server {name:?} not found; pair first");
+    }
+    if save_defaults {
+        let saved = !fwd.is_empty();
+        store.set_forwards(&name, fwd.clone());
+        store.save(&servers_path)?;
+        if saved {
+            println!("saved default forwards for {name}");
+        } else {
+            println!("cleared default forwards for {name}");
+        }
+    }
+    // Explicit --fwd specs replace the saved default forwards.
+    let spec_strs = if fwd.is_empty() {
+        store
+            .get(&name)
+            .map(|e| e.forwards.clone())
+            .unwrap_or_default()
+    } else {
+        fwd
+    };
+    if spec_strs.is_empty() {
+        bail!("at least one --fwd spec is required (no default forwards saved for {name})");
     }
     let mut specs = Vec::new();
-    for spec in fwd {
+    for spec in spec_strs {
         specs.push(parse_fwd_spec(&spec)?);
     }
     let shutdown = Arc::new(Notify::new());

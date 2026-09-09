@@ -5,6 +5,7 @@ fn entry(name: &str, node_id: &str) -> ServerEntry {
         name: name.to_string(),
         node_id: node_id.to_string(),
         paired_at: "2026-09-07T12:00:00Z".to_string(),
+        forwards: Vec::new(),
     }
 }
 
@@ -94,4 +95,47 @@ fn multiple_servers_coexist_and_lookup_by_node() {
     assert_eq!(store.servers.len(), 3);
     assert_eq!(store.get_by_node_id("bbbb").unwrap().name, "homelab");
     assert!(store.get_by_node_id("dddd").is_none());
+}
+
+#[test]
+fn set_forwards_round_trip() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("servers.toml");
+
+    let mut store = ClientStore::load(&path).unwrap();
+    store.upsert(entry("mybox", "aaaa")).unwrap();
+    assert!(store.set_forwards("mybox", vec!["2222:localhost:22".to_string()]));
+    store.save(&path).unwrap();
+
+    let loaded = ClientStore::load(&path).unwrap();
+    assert_eq!(
+        loaded.get("mybox").unwrap().forwards,
+        vec!["2222:localhost:22"]
+    );
+}
+
+#[test]
+fn set_forwards_unknown_server_is_noop() {
+    let mut store = ClientStore::default();
+    assert!(!store.set_forwards("nope", vec!["2222:localhost:22".to_string()]));
+}
+
+#[test]
+fn empty_forwards_omitted_and_old_files_load() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("servers.toml");
+    std::fs::write(
+        &path,
+        "version = 1\n\n[[servers]]\nname = \"mybox\"\nnode_id = \"aaaa\"\n\
+         paired_at = \"2026-09-07T12:00:00Z\"\n",
+    )
+    .unwrap();
+
+    let mut loaded = ClientStore::load(&path).unwrap();
+    assert!(loaded.get("mybox").unwrap().forwards.is_empty());
+
+    loaded.set_forwards("mybox", Vec::new());
+    loaded.save(&path).unwrap();
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(!text.contains("forwards"));
 }

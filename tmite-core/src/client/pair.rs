@@ -175,10 +175,16 @@ pub async fn run(params: PairParams, ui: &dyn PairUi) -> Result<String, PairErro
     let store_path = servers_toml_path(&params.data_dir);
     let mut store = ClientStore::load(&store_path)?;
     let stored_name = params.name.clone().unwrap_or(name);
+    // Re-pairing the same server keeps any saved default forwards.
+    let forwards = store
+        .get_by_node_id(&server_id.to_string())
+        .map(|e| e.forwards.clone())
+        .unwrap_or_default();
     store.upsert(ServerEntry {
         name: stored_name.clone(),
         node_id: server_id.to_string(),
         paired_at: now_rfc3339(),
+        forwards,
     })?;
     store.save(&store_path)?;
 
