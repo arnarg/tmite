@@ -460,24 +460,18 @@ Pinned: `iroh = "1"` (lockfile pins the exact minor; the n0 API surface moved su
 - **Client endpoint:** transport config sets keep-alive ~15 s and a generous max idle timeout (§7.2). The client dials the pinned NodeId from `servers.toml`.
 - **Invite endpoints:** same helper with the derived key and `tmite-pair/1`; each registers the pkarr publisher so the client can resolve `invite_id` by NodeId alone. Shutdown via the endpoint's drop/close; ensure the derived `SecretKey` is zeroized on drop (`zeroize`).
 - **Custom infrastructure:** `--relay` (repeatable) replaces the relay map; `--pkarr` points publishing/resolution at a self-hosted pkarr relay. When either is set, build the endpoint from the `Minimal` preset plus exactly the requested services. Public n0 relays rate-limit; self-hosting is the documented escape hatch. Dependency on public infrastructure is limited to: invite windows (15 min) and, on the data plane, relay fallback when hole punching fails (direct connections dominate after the first dial).
-- **Deployment:** systemd unit template in the repo:
+- **Deployment:** the nix flake is the official way to install and run tmite.
+  It builds the `tmite` binary (`nix build`) and provides a NixOS module
+  (`nixosModules.default`, `services.tmite.enable`) that runs `tmite daemon`
+  as a systemd service:
 
 ```ini
-[Unit]
-Description=tmite tunnel daemon
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-ExecStart=/usr/local/bin/tmite daemon
-Restart=on-failure
+# Managed by the NixOS module (nix/modules/nixos.nix):
 User=tmite
 Group=tmite
-StateDirectory=tmite
-RuntimeDirectory=tmite
-# StateDirectory ⇒ /var/lib/tmite, RuntimeDirectory ⇒ /run/tmite
-# (systemd chowns both to User=/Group=tmite; socket mode 0660 lets
-# `tmite`-group members run the admin CLI)
+StateDirectory=tmite       # ⇒ /var/lib/tmite
+RuntimeDirectory=tmite     # ⇒ /run/tmite, IPC socket mode 0660
+# Socket mode 0660 lets `tmite`-group members run the admin CLI
 ```
 
 ---

@@ -1,4 +1,6 @@
-# tmite
+<p align="center">
+  <img alt="tmite screenshot" src="./screenshot.png" />
+</p>
 
 Temporary forwarding tunnels between two machines over
 [iroh](https://crates.io/crates/iroh): encrypted QUIC with NAT traversal and
@@ -9,12 +11,12 @@ client runs local listeners and carries traffic over a single multiplexed
 iroh connection.
 
 ```
-tmite daemon                        # on the server (systemd unit in packaging/)
-tmite admin peers invite --name laptop     # prints a 5-word code, waits
-tmite pair "ocean pixel falcon ..." # on the laptop
+tmite daemon                                 # on the server
+tmite admin peers invite --name laptop       # prints a 5-word code, waits
+tmite pair "ocean pixel falcon ..."          # on the laptop
 tmite admin peers allow laptop localhost:22
 tmite connect laptop --fwd 2222:localhost:22
-ssh -p 2222 localhost               # from anywhere; no open ports on either side
+ssh -p 2222 localhost
 ```
 
 ## Layout
@@ -26,24 +28,54 @@ tmite-core/    all async logic: endpoint builder, daemon (data plane,
                invites, IPC, state), client (pair, session, connect)
 tmite/         the `tmite` binary: clap parsing, prompts, printing, exit codes
 vectors/       golden pairing vectors + handshake transcript (CI regenerates)
-packaging/     tmite.service systemd unit
 ```
 
-## Building and testing
+## Install
 
-```
-cargo build --release
-cargo test --workspace
-```
+Nix flake:
 
-Regenerate the committed golden vectors after changing the pairing scheme:
-
-```
-cargo run -p tmite-core --example gen_vectors
-cargo run -p tmite-core --example gen_transcript
+```sh
+nix build github:arnarg/tmite
 ```
 
-## Running
+## Usage
+
+### NixOS module
+
+```nix
+{
+  inputs.nixpkgs.url = "github:nixos/nixpkgs/nixos-26.05";
+  inputs.tmite.url = "github:arnarg/tmite";
+
+  outputs = { nixpkgs, tmite, ... }: {
+    nixosConfigurations.myserver = nixpkgs.lib.nixosSystem {
+      modules = [
+        tmite.nixosModules.default
+        {
+          services.tmite.enable = true;
+
+          # Optional: fixed UDP port if a firewall needs a static allow rule,
+          # self-hosted iroh infrastructure (the public n0 relays rate-limit).
+          # services.tmite.port = 42991;
+          # services.tmite.relays = [ "wss://relay.example.com" ];
+          # services.tmite.pkarr = "https://pkarr.example.com/pkarr";
+
+          # Add your user to the "tmite" group to run admin commands.
+          # users.users.<username>.extraGroups = [ "tmite" ];
+        }
+      ];
+    };
+  };
+}
+```
+
+This runs `tmite daemon` as a systemd service with state in `/var/lib/tmite`
+(`StateDirectory=tmite`) and the admin IPC socket in `/run/tmite/daemon.sock`
+(`RuntimeDirectory=tmite`, mode 0660). Users in the daemon's group can run the
+admin CLI; for a non-root daemon the socket lives in `$XDG_RUNTIME_DIR/tmite/`
+instead.
+
+### Run from source
 
 Development (everything under the repo):
 
@@ -55,11 +87,22 @@ cargo run -- peer allow   --data-dir ./data --socket-path ./run/daemon.sock lapt
 cargo run -- node-id      --data-dir ./data
 ```
 
-Production: install the binary plus `packaging/tmite.service`; state lives in
-`/var/lib/tmite` (`StateDirectory=tmite`), the admin IPC socket in
-`/run/tmite/daemon.sock` (`RuntimeDirectory=tmite`, mode 0660). Users in the
-daemon's group can run the admin CLI; for a non-root daemon the socket lives
-in `$XDG_RUNTIME_DIR/tmite/` instead.
+## Development
+
+```sh
+cargo build                                   # build
+cargo test --workspace                        # all tests, fully offline
+cargo clippy --all-targets -- --deny warnings # what nix flake check enforces
+cargo fmt
+nix flake check                               # clippy (--all-targets --deny warnings) + fmt gates
+```
+
+Regenerate the committed golden vectors after changing the pairing scheme:
+
+```
+cargo run -p tmite-core --example gen_vectors
+cargo run -p tmite-core --example gen_transcript
+```
 
 ## Pairing model
 
