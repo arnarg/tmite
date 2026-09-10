@@ -23,6 +23,8 @@ pub enum NetError {
 pub struct NetOpts {
     pub relay_urls: Vec<String>,
     pub pkarr_url: Option<String>,
+    /// Fixed UDP port for the daemon main endpoint (firewall pinning).
+    /// Ignored for ephemeral (`Invite`) endpoints, which bind a random port.
     pub bind_port: Option<u16>,
 }
 
@@ -97,7 +99,13 @@ pub async fn build_endpoint(
         .alpns(alpns)
         .transport_config(transport);
 
-    if let Some(port) = opts.bind_port {
+    // If bind_port is set, invite endpoints will not be able
+    // to bind to the port because it's occupied by the main
+    // endpoint. Therefore we ignore this option when creating
+    // invite endpoints only.
+    if role != EndpointRole::Invite
+        && let Some(port) = opts.bind_port
+    {
         for addr in [
             SocketAddr::from((Ipv4Addr::UNSPECIFIED, port)),
             SocketAddr::from((Ipv6Addr::UNSPECIFIED, port)),
