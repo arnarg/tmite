@@ -1,3 +1,5 @@
+<h1 align="center">tmite</h1>
+
 <p align="center">
   <img alt="tmite screenshot" src="./screenshot.png" />
 </p>
