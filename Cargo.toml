@@ -3,7 +3,7 @@ resolver = "2"
 members = ["tmite-proto", "tmite-core", "tmite"]
 
 [workspace.package]
-version = "0.10.1"
+version = "0.10.2"
 edition = "2024"
 license = "MIT"
 

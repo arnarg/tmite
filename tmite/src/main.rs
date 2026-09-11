@@ -581,11 +581,9 @@ fn print_sessions_table(result: &tmite_proto::ipc::SessionsResult) {
                             tmite_proto::ipc::PathKind::Direct => "direct".to_string(),
                             tmite_proto::ipc::PathKind::Relay => "relay".to_string(),
                         };
-                        let addr = match (&path.kind, &path.addr) {
-                            (tmite_proto::ipc::PathKind::Direct, Some(addr)) => {
-                                format!(" {addr}")
-                            }
-                            _ => String::new(),
+                        let addr = match &path.addr {
+                            Some(addr) => format!(" {addr}"),
+                            None => String::new(),
                         };
                         let rtt = path
                             .rtt_ms
