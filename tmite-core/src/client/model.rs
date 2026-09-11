@@ -77,6 +77,12 @@ pub struct ConnectModel {
     pub forwards: Vec<ForwardRow>,
     pub connections: Vec<ConnRow>,
     pub closed_total: u64,
+    /// Byte totals folded in from closed connections (`ConnRow` counters are
+    /// only kept for active ones). Undercounts ≤500 ms of traffic per close
+    /// (the byte-tick interval); exact totals would need final bytes in the
+    /// `ConnectionClosed` event.
+    pub total_tx: u64,
+    pub total_rx: u64,
     /// Transient warning/denied message with the instant it arrived.
     pub status: Option<(Instant, String)>,
 }
@@ -119,6 +125,10 @@ impl ConnectModel {
                 }
             }
             UiEvent::ConnectionClosed { id } => {
+                if let Some(row) = self.connections.iter().find(|c| c.id == id) {
+                    self.total_tx += row.tx_bytes;
+                    self.total_rx += row.rx_bytes;
+                }
                 self.connections.retain(|c| c.id != id);
                 self.closed_total += 1;
             }
@@ -367,6 +377,8 @@ mod tests {
         assert_eq!(m.connections.len(), 1);
         assert_eq!(m.connections[0].id, 2);
         assert_eq!(m.closed_total, 1);
+        assert_eq!(m.total_tx, 100);
+        assert_eq!(m.total_rx, 200);
     }
 
     #[test]

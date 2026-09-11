@@ -806,8 +806,11 @@ async fn connect_cmd(
         let n_forwards = params.specs.len();
         let tui_task = tokio::spawn(tui::run(rx, shutdown.clone(), n_forwards));
         let result = tmite_core::client::connect::run(params).await;
-        // Wait for the terminal to be restored before reporting errors.
-        let _ = tui_task.await;
+        // Wait for the terminal to be restored before reporting errors and
+        // printing the end-of-session summary.
+        if let Ok(Ok(model)) = tui_task.await {
+            tui::print_summary(&model);
+        }
         result.map_err(anyhow::Error::from)
     } else {
         println!("Connecting to {name}...");

@@ -12,7 +12,7 @@ use std::time::Duration;
 use anyhow::Result;
 use n0_future::StreamExt;
 use ratatui::backend::CrosstermBackend;
-use ratatui::crossterm::cursor::Hide;
+use ratatui::crossterm::cursor::{Hide, MoveTo};
 use ratatui::crossterm::event::{Event, EventStream, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use ratatui::layout::{Constraint, Layout};
@@ -24,7 +24,6 @@ use tokio::sync::Notify;
 use tokio::sync::mpsc;
 
 use tmite_core::client::model::{ConnectModel, SessionState};
-
 const TICK: Duration = Duration::from_millis(500);
 /// Status (Notice) messages disappear after this long.
 const NOTICE_TTL: Duration = Duration::from_secs(5);
@@ -42,7 +41,7 @@ pub async fn run(
     mut rx: mpsc::UnboundedReceiver<tmite_core::client::model::UiEvent>,
     shutdown: Arc<Notify>,
     n_forwards: usize,
-) -> Result<()> {
+) -> Result<ConnectModel> {
     enable_raw_mode()?;
     let _guard = RawGuard;
     ratatui::crossterm::execute!(stdout(), Hide)?;
@@ -60,6 +59,14 @@ pub async fn run(
     let mut events = EventStream::new();
     let mut tick = tokio::time::interval(TICK);
     let mut paused = false;
+    // Viewport rect (terminal coords) from the last draw; needed to park
+    // the cursor on exit. Must come from `Frame::area` (`CompletedFrame::area`
+    // is the full terminal for inline viewports).
+    let mut last_area = ratatui::layout::Rect::default();
+    terminal.draw(|f| {
+        last_area = f.area();
+        render(&model, f);
+    })?;
 
     loop {
         tokio::select! {
@@ -98,10 +105,46 @@ pub async fn run(
             model.status = None;
         }
         if !paused {
-            terminal.draw(|f| render(&model, f))?;
+            terminal.draw(|f| {
+                last_area = f.area();
+                render(&model, f);
+            })?;
         }
     }
-    Ok(())
+    // Clear the inline viewport before restoring the terminal. For inline
+    // mode this clears from the viewport origin down, leaving scrollback
+    // above untouched.
+    terminal.clear()?;
+    // `clear()` restores the cursor to its mid-viewport position; park it at
+    // column 0 of the viewport's top row so the summary prints cleanly.
+    ratatui::crossterm::execute!(stdout(), MoveTo(0, last_area.y))?;
+    Ok(model)
+}
+
+/// Post-exit summary printed by `main` after the terminal is restored.
+pub fn print_summary(model: &ConnectModel) {
+    let up = model
+        .started_at
+        .map(|t| fmt_elapsed(t.elapsed()))
+        .unwrap_or_else(|| "0s".into());
+    println!(
+        "tmite connect ended after {up} - {} ({})",
+        model.server_name,
+        short_node(&model.server_node),
+    );
+    // Closed connections' bytes live in the totals; active rows' last-ticked
+    // bytes are still in `connections`.
+    let tx = model.total_tx + model.connections.iter().map(|c| c.tx_bytes).sum::<u64>();
+    let rx = model.total_rx + model.connections.iter().map(|c| c.rx_bytes).sum::<u64>();
+    let served = model.closed_total + model.connections.len() as u64;
+    println!(
+        "served {served} connection(s) · {} ↑ · {} ↓",
+        fmt_bytes(tx),
+        fmt_bytes(rx)
+    );
+    for fwd in &model.forwards {
+        println!("  {} → {}", fwd.local, fwd.target);
+    }
 }
 
 /// Fixed viewport height: header + 3 path rows + forwards + 5 connection
